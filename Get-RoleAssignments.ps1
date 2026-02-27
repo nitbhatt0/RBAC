@@ -405,7 +405,9 @@ if ($SentinelWorkspaces.Count -gt 0) {
         "Microsoft Sentinel Contributor",
         "Microsoft Sentinel Reader",
         "Microsoft Sentinel Responder",
-        "Microsoft Sentinel Automation Contributor"
+        "Microsoft Sentinel Automation Contributor",
+        "Log Analytics Contributor",
+        "Log Analytics Reader"
     )
 
     $allSentinelRoles = @()
@@ -1076,32 +1078,8 @@ if ($IncludeXDRRBAC) {
     $mdeDeviceGroups    = @()
     $mdeDeviceGroupsRaw = @()
 
-    try {
-        # Security Graph beta: GET /beta/security/deviceGroups
-        $dgResponse = Invoke-MgGraphRequest `
-            -Method GET `
-            -Uri "https://graph.microsoft.com/beta/deviceManagement/deviceCompliancePolicies" `
-            -ErrorAction SilentlyContinue
-
-        # Primary endpoint for MDE device groups
-        $dgResponse2 = Invoke-MgGraphRequest `
-            -Method GET `
-            -Uri "https://graph.microsoft.com/beta/security/identitySecurityDefaultsEnforcementPolicy" `
-            -ErrorAction SilentlyContinue
-
-        # Use the correct MDE machine groups endpoint
-        $dgMainResponse = Invoke-MgGraphRequest `
-            -Method GET `
-            -Uri "https://graph.microsoft.com/beta/security/secure scores" `
-            -ErrorAction SilentlyContinue
-    }
-    catch {
-        # Silently continue -- the device group API may not be available via Graph beta
-        # in all tenants. We will note this in the output.
-    }
-
-    # The MDE device group API is available via the MDE/WDATP REST API rather than
-    # the standard Graph endpoint. Use Invoke-MgGraphRequest with the security endpoint.
+    # The MDE device group API is available via the MDE/WDATP REST API.
+    # Use Invoke-MgGraphRequest with the securitycenter endpoint.
     try {
         $machineGroupsUri = "https://api.securitycenter.microsoft.com/api/machinegroups"
 
