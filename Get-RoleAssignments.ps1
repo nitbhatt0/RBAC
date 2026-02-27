@@ -214,10 +214,23 @@ catch {
 
 Write-Step "Fetching active directory role assignments..."
 
+# Only these roles are in scope for Section 1 and Section 2
+$targetEntraRoles = @(
+    "Global Administrator",
+    "Security Administrator",
+    "Security Operator",
+    "Global Reader",
+    "Security Reader"
+)
+
 $entraRoleAssignments = @()
 
 try {
     $activeRoles = Get-MgDirectoryRole -All -ErrorAction Stop
+
+    # Filter to only the target roles
+    $activeRoles = $activeRoles | Where-Object { $_.DisplayName -in $targetEntraRoles }
+    Write-OK "Scoping to $($activeRoles.Count) target role(s): $($targetEntraRoles -join ', ')"
 
     foreach ($role in $activeRoles) {
         Write-Step "  Processing role: $($role.DisplayName)"
@@ -331,6 +344,8 @@ if ($IncludePIM) {
     try {
         $eligibleAssignments = Get-MgRoleManagementDirectoryRoleEligibilitySchedule -All -ErrorAction Stop
 
+        Write-OK "Total PIM eligible assignments found: $($eligibleAssignments.Count). Filtering to target roles only..."
+
         foreach ($assignment in $eligibleAssignments) {
             $principalId = $assignment.PrincipalId
             $roleDefId   = $assignment.RoleDefinitionId
@@ -338,6 +353,9 @@ if ($IncludePIM) {
             $roleDef = Get-MgRoleManagementDirectoryRoleDefinition `
                            -UnifiedRoleDefinitionId $roleDefId `
                            -ErrorAction SilentlyContinue
+
+            # Skip roles not in the target list
+            if ($roleDef.DisplayName -notin $targetEntraRoles) { continue }
 
             $user = Get-MgUser -UserId $principalId `
                         -Property "DisplayName,UserPrincipalName,Mail,Department" `
@@ -387,9 +405,7 @@ if ($SentinelWorkspaces.Count -gt 0) {
         "Microsoft Sentinel Contributor",
         "Microsoft Sentinel Reader",
         "Microsoft Sentinel Responder",
-        "Microsoft Sentinel Automation Contributor",
-        "Log Analytics Contributor",
-        "Log Analytics Reader"
+        "Microsoft Sentinel Automation Contributor"
     )
 
     $allSentinelRoles = @()
@@ -460,6 +476,141 @@ if ($SentinelWorkspaces.Count -gt 0) {
 
     Export-Results -Data $sentinelSummary -FileName "3_Sentinel_Workspace_Summary" -Format $ExportFormat
     Write-OK "Total Sentinel role assignments across all workspaces: $($allSentinelRoles.Count)"
+
+    # =========================================================================
+    # 3b - Custom Permission Scan: Find any Azure role definitions that include
+    #      Sentinel/Log Analytics permissions and report who holds those roles
+    # =========================================================================
+    Write-Step "3b - Scanning for custom/built-in roles with Sentinel-relevant permissions..."
+
+    # The specific permission actions to match against
+    $sentinelPermissionActions = @(
+        "Microsoft.SecurityInsights/*/read",
+        "Microsoft.SecurityInsights/dataConnectorsCheckRequirements/action",
+        "Microsoft.SecurityInsights/threatIntelligence/indicators/query/action",
+        "Microsoft.SecurityInsights/threatIntelligence/queryIndicators/action",
+        "Microsoft.OperationalInsights/workspaces/analytics/query/action",
+        "Microsoft.OperationalInsights/workspaces/*/read",
+        "Microsoft.OperationalInsights/workspaces/LinkedServices/read",
+        "Microsoft.OperationalInsights/workspaces/savedSearches/read",
+        "Microsoft.OperationsManagement/solutions/read",
+        "Microsoft.OperationalInsights/workspaces/query/read",
+        "Microsoft.OperationalInsights/workspaces/query/*/read",
+        "Microsoft.OperationalInsights/querypacks/*/read",
+        "Microsoft.OperationalInsights/workspaces/dataSources/read",
+        "Microsoft.Insights/workbooks/read",
+        "Microsoft.Insights/myworkbooks/read",
+        "Microsoft.Authorization/*/read",
+        "Microsoft.Insights/alertRules/*",
+        "Microsoft.Resources/deployments/*",
+        "Microsoft.Resources/subscriptions/resourceGroups/read",
+        "Microsoft.Resources/templateSpecs/*/read",
+        "Microsoft.Support/*",
+        "Microsoft.SecurityInsights/automationRules/*",
+        "Microsoft.SecurityInsights/cases/*",
+        "Microsoft.SecurityInsights/incidents/*",
+        "Microsoft.SecurityInsights/entities/runPlaybook/action",
+        "Microsoft.SecurityInsights/threatIntelligence/indicators/appendTags/action",
+        "Microsoft.SecurityInsights/threatIntelligence/bulkTag/action",
+        "Microsoft.SecurityInsights/threatIntelligence/indicators/replaceTags/action",
+        "Microsoft.SecurityInsights/businessApplicationAgents/systems/undoAction/action",
+        "Microsoft.SecurityInsights/*",
+        "Microsoft.OperationalInsights/workspaces/savedSearches/*",
+        "Microsoft.Insights/workbooks/*"
+    )
+
+    $customPermissionRows = @()
+
+    foreach ($ws in $SentinelWorkspaces) {
+
+        if (-not $ws.WorkspaceId -or -not $ws.ResourceGroup -or -not $ws.SubscriptionId) { continue }
+
+        $wsSubId = $ws.SubscriptionId
+        $wsRG    = $ws.ResourceGroup
+        $wsId    = $ws.WorkspaceId
+
+        Write-Step "  3b scanning workspace: $wsId"
+
+        try {
+            Set-AzContext -SubscriptionId $wsSubId -ErrorAction Stop | Out-Null
+
+            $sentinelScope = "/subscriptions/$wsSubId/resourceGroups/$wsRG"
+
+            # Get ALL role assignments at this scope (not filtered by name)
+            $allAssignmentsAtScope = Get-AzRoleAssignment -Scope $sentinelScope -ErrorAction Stop
+
+            foreach ($ra in $allAssignmentsAtScope) {
+
+                # Skip roles already captured in the standard role list above
+                if ($ra.RoleDefinitionName -in $sentinelRoleNames) { continue }
+
+                # Fetch the full role definition to inspect its permissions.
+                # -WarningAction SilentlyContinue suppresses the Az 16.x breaking-change
+                # notice about flattened properties -- we already use Permissions[n].Actions
+                # and Permissions[n].DataActions which is the correct forward-compatible form.
+                try {
+                    $roleDef = Get-AzRoleDefinition -Id $ra.RoleDefinitionId `
+                                   -WarningAction SilentlyContinue `
+                                   -ErrorAction SilentlyContinue
+                    if (-not $roleDef) { continue }
+
+                    # Collect all actions and data actions via Permissions collection
+                    # (forward-compatible with Az 16.x -- avoids the deprecated flat properties)
+                    $allActions = @()
+                    foreach ($perm in $roleDef.Permissions) {
+                        if ($perm.Actions)     { $allActions += @($perm.Actions) }
+                        if ($perm.DataActions) { $allActions += @($perm.DataActions) }
+                    }
+
+                    # Check if any of the role's actions match our target permissions
+                    # Supports wildcard matching (e.g. Microsoft.SecurityInsights/* matches Microsoft.SecurityInsights/incidents/read)
+                    $matchedPermissions = @()
+                    foreach ($targetAction in $sentinelPermissionActions) {
+                        # Convert the target action wildcard pattern to a regex
+                        $pattern = "^" + [regex]::Escape($targetAction).Replace("\*", ".*") + "$"
+                        foreach ($action in $allActions) {
+                            if ($action -match $pattern -and $matchedPermissions -notcontains $targetAction) {
+                                $matchedPermissions += $targetAction
+                            }
+                        }
+                        # Also check if a wildcard action in the role covers the target (e.g. role has "Microsoft.SecurityInsights/*")
+                        foreach ($action in $allActions) {
+                            $actionPattern = "^" + [regex]::Escape($action).Replace("\*", ".*") + "$"
+                            if ($targetAction -match $actionPattern -and $matchedPermissions -notcontains $targetAction) {
+                                $matchedPermissions += $targetAction
+                            }
+                        }
+                    }
+
+                    if ($matchedPermissions.Count -gt 0) {
+                        $customPermissionRows += [PSCustomObject]@{
+                            WorkspaceId          = $wsId
+                            ResourceGroup        = $wsRG
+                            SubscriptionId       = $wsSubId
+                            RoleName             = $ra.RoleDefinitionName
+                            RoleType             = $roleDef.RoleType   # BuiltInRole or CustomRole
+                            PrincipalName        = $ra.DisplayName
+                            PrincipalType        = $ra.ObjectType
+                            SignInName           = $ra.SignInName
+                            Scope                = $ra.Scope
+                            MatchedPermissions   = ($matchedPermissions -join "; ")
+                            MatchedCount         = $matchedPermissions.Count
+                            ExportedAt           = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                        }
+                    }
+                }
+                catch {
+                    Write-Warn "    Could not inspect role definition for '$($ra.RoleDefinitionName)': $_"
+                }
+            }
+        }
+        catch {
+            Write-Warn "  3b scan failed for workspace $wsId : $_"
+        }
+    }
+
+    Write-OK "3b - Found $($customPermissionRows.Count) role assignment(s) with matching Sentinel permissions (outside standard roles)"
+    Export-Results -Data $customPermissionRows -FileName "3b_Sentinel_CustomPermission_Assignments" -Format $ExportFormat
 }
 else {
     Write-Warn "Sentinel workspace roles skipped. Use -SentinelWorkspaces to provide workspace definitions."
