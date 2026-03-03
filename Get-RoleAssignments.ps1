@@ -1,67 +1,21 @@
-# =============================================================================
-# Get-RoleAssignments.ps1
-# Downloads current role assignments from:
-#   - Microsoft Entra ID (Azure AD)         - Directory Roles
-#   - Microsoft Entra ID (PIM)              - Eligible Role Assignments
-#   - Microsoft Defender XDR               - Complete RBAC (MDE/MDO/MDI/MCAS)
-#   - Microsoft Sentinel                   - Workspace RBAC Roles
-#   - Microsoft Defender for Cloud         - Owner, Contributor, Security Admin
-#                                            across ALL MDC-enabled subscriptions
-#   - Microsoft Purview                    - Compliance Role Groups and Members
-#   - Microsoft Defender for Endpoint      - MDE Custom RBAC Roles, Role
-#                                            Assignments, and Device Group Scoping
+# Get-RoleAssignments.ps1  v1.8
+# Exports role assignments from: Entra ID, PIM, Sentinel, Defender for Cloud, Purview, Defender XDR
 #
-# Prerequisites:
-#   Install-Module Microsoft.Graph          -Scope CurrentUser
-#   Install-Module Az                       -Scope CurrentUser
-#   Install-Module Az.Security              -Scope CurrentUser   (for MDC scan)
-#   Install-Module ExchangeOnlineManagement -Scope CurrentUser   (for Purview)
-#
-#   Section 6 (XDR Complete RBAC) uses the Security Graph beta endpoint and
-#   requires SecurityRolesAndAssignments.Read.All. 
-#   MDE custom RBAC must be enabled in your tenant (Defender portal > Settings > Endpoints > Roles >
-#   "Turn on roles"). 
-#   MDO roles require Exchange Online PowerShell.
-#   CloudApps native roles require CloudApp.Read.All Graph permission.
+# Section 6 requires an App Registration with Admin Consent for:
+#   WindowsDefenderATP (Application)          : Machine.Read.All, Machine.ReadWrite.All,
+#                                               SecurityConfiguration.Read.All, AdvancedQuery.Read.All
+#   Microsoft Threat Protection (Application) : AdvancedHunting.Read.All
 #
 # Author : Nitin
-# Version: 1.5
-# =============================================================================
 
 #Requires -Version 5.1
 
 [CmdletBinding()]
 param(
-    # --- Multi-workspace Sentinel support ---
-    # Pass one or more workspace definitions as a hashtable array. Each entry must
-    # contain three keys: WorkspaceId, ResourceGroup, SubscriptionId
-    #
-    # Single workspace:
-    #   -SentinelWorkspaces @(
-    #       @{ WorkspaceId = "ws-id-1"; ResourceGroup = "rg-sentinel"; SubscriptionId = "sub-id-1" }
-    #   )
-    #
-    # Multiple workspaces:
-    #   -SentinelWorkspaces @(
-    #       @{ WorkspaceId = "ws-id-1"; ResourceGroup = "rg-sentinel-prod"; SubscriptionId = "sub-id-1" },
-    #       @{ WorkspaceId = "ws-id-2"; ResourceGroup = "rg-sentinel-dev";  SubscriptionId = "sub-id-2" },
-    #       @{ WorkspaceId = "ws-id-3"; ResourceGroup = "rg-sentinel-corp"; SubscriptionId = "sub-id-3" }
-    #   )
-    #
-    # MDE RBAC only (quick access audit):
-    #   -IncludeXDRRBAC
-    #
-    # Full export including XDR complete RBAC:
-    #   -IncludePIM -ScanDefenderForCloud -IncludeXDRRBAC -ExportFormat Both
-    #
-    # XDR RBAC with Sentinel workspaces:
-    #   -SentinelWorkspaces @(
-    #       @{ WorkspaceId = "ws-id-1"; ResourceGroup = "rg-sentinel-prod"; SubscriptionId = "sub-id-1" }
-    #   ) -IncludeXDRRBAC -ExportFormat Both
     [Parameter(HelpMessage = "Array of Sentinel workspace definitions: @{ WorkspaceId=''; ResourceGroup=''; SubscriptionId='' }")]
     [hashtable[]]$SentinelWorkspaces = @(),
 
-    [Parameter(HelpMessage = "Output folder path. Defaults to timestamped folder in current directory.")]
+    [Parameter(HelpMessage = "Output folder path.")]
     [string]$OutputPath = ".\RoleAssignments_$(Get-Date -Format 'yyyyMMdd_HHmmss')",
 
     [Parameter(HelpMessage = "Export format: CSV, JSON, or Both.")]
@@ -71,23 +25,26 @@ param(
     [Parameter(HelpMessage = "Include PIM eligible role assignments (requires Entra P2).")]
     [switch]$IncludePIM,
 
-    [Parameter(HelpMessage = "Scan ALL accessible subscriptions for MDC and export targeted RBAC.")]
+    [Parameter(HelpMessage = "Scan all accessible subscriptions for Defender for Cloud RBAC.")]
     [switch]$ScanDefenderForCloud,
 
-    [Parameter(HelpMessage = "Export Microsoft Purview compliance role groups and their members.")]
+    [Parameter(HelpMessage = "Export Purview compliance role groups and members.")]
     [switch]$IncludePurview,
 
-    [Parameter(HelpMessage = "Admin UPN used to connect to Purview (required when -IncludePurview is set).")]
+    [Parameter(HelpMessage = "Admin UPN for Purview connection (required with -IncludePurview).")]
     [string]$PurviewAdminUPN,
 
-    # --- MDE RBAC (Section 7) ---
-    # Exports MDE-specific custom RBAC roles, role assignments (user/group to role),
-    # and device group scoping (which device groups each role can access).
-    # Requires: MDE custom RBAC enabled in tenant (XDR portal > Settings > Endpoints > Roles > "Turn on roles") AND SecurityRolesAndAssignments.Read.All
-    # Graph permission. 
-    # If MDE custom RBAC is not enabled this section will fall back to reporting Entra ID roles that have MDE access.
-    [Parameter(HelpMessage = "Export full XDR RBAC: MDE custom roles, MDO email roles, MCAS native roles, MDI via Entra, and unified access matrix.")]
-    [switch]$IncludeXDRRBAC
+    [Parameter(HelpMessage = "Export full XDR RBAC: MDE roles, device groups, access matrix, Entra cross-reference, Advanced Hunting identity audit.")]
+    [switch]$IncludeXDRRBAC,
+
+    [Parameter(HelpMessage = "App Registration Client ID (required for Section 6).")]
+    [string]$AppClientId,
+
+    [Parameter(HelpMessage = "App Registration Client Secret (required for Section 6).")]
+    [string]$AppClientSecret,
+
+    [Parameter(HelpMessage = "Tenant ID for the App Registration. Defaults to current Graph tenant.")]
+    [string]$AppTenantId
 )
 
 # =============================================================================
@@ -118,15 +75,8 @@ function Write-Warn {
 }
 
 function Export-Results {
-    param(
-        [object[]]$Data,
-        [string]$FileName,
-        [string]$Format
-    )
-    if (-not $Data -or $Data.Count -eq 0) {
-        Write-Warn "No data to export for: $FileName"
-        return
-    }
+    param([object[]]$Data, [string]$FileName, [string]$Format)
+    if (-not $Data -or $Data.Count -eq 0) { Write-Warn "No data to export for: $FileName"; return }
     if ($Format -in @("CSV", "Both")) {
         $Data | Export-Csv -Path "$OutputPath\$FileName.csv" -NoTypeInformation -Encoding UTF8
         Write-OK "Exported $($Data.Count) rows -> $FileName.csv"
@@ -138,17 +88,16 @@ function Export-Results {
 }
 
 # =============================================================================
-# Setup - Output folder and module loading
+# Setup
 # =============================================================================
 
-Write-Header "Microsoft Security Stack - Role Assignments Export v1.5"
+Write-Header "Microsoft Security Stack - Role Assignments Export v1.8"
 
 if (-not (Test-Path $OutputPath)) {
     New-Item -ItemType Directory -Path $OutputPath | Out-Null
     Write-OK "Output folder created: $OutputPath"
 }
 
-# Build required module list based on switches
 $requiredModules = @(
     "Microsoft.Graph.Identity.DirectoryManagement",
     "Microsoft.Graph.Users",
@@ -158,10 +107,7 @@ if ($IncludePIM)           { $requiredModules += "Microsoft.Graph.Identity.Gover
 if ($SubscriptionId)       { $requiredModules += "Az.Accounts", "Az.Resources" }
 if ($ScanDefenderForCloud) { $requiredModules += "Az.Accounts", "Az.Resources", "Az.Security" }
 if ($IncludePurview)       { $requiredModules += "ExchangeOnlineManagement" }
-# Section 7 (MDE RBAC) uses Invoke-MgGraphRequest (already in Microsoft.Graph.Authentication)
-# No additional module install required -- Graph connection from Section 1 is reused.
 
-# Deduplicate
 $requiredModules = $requiredModules | Sort-Object -Unique
 
 Write-Step "Checking and loading required modules..."
@@ -214,7 +160,6 @@ catch {
 
 Write-Step "Fetching active directory role assignments..."
 
-# Only these roles are in scope for Section 1 and Section 2
 $targetEntraRoles = @(
     "Global Administrator",
     "Security Administrator",
@@ -227,8 +172,6 @@ $entraRoleAssignments = @()
 
 try {
     $activeRoles = Get-MgDirectoryRole -All -ErrorAction Stop
-
-    # Filter to only the target roles
     $activeRoles = $activeRoles | Where-Object { $_.DisplayName -in $targetEntraRoles }
     Write-OK "Scoping to $($activeRoles.Count) target role(s): $($targetEntraRoles -join ', ')"
 
@@ -293,8 +236,7 @@ try {
                     }
 
                     "servicePrincipal" {
-                        $spNameKey = "displayName"
-                        $spName    = $member.AdditionalProperties[$spNameKey]
+                        $spName = $member.AdditionalProperties["displayName"]
 
                         $entraRoleAssignments += [PSCustomObject]@{
                             RoleName          = $role.DisplayName
@@ -343,7 +285,6 @@ if ($IncludePIM) {
 
     try {
         $eligibleAssignments = Get-MgRoleManagementDirectoryRoleEligibilitySchedule -All -ErrorAction Stop
-
         Write-OK "Total PIM eligible assignments found: $($eligibleAssignments.Count). Filtering to target roles only..."
 
         foreach ($assignment in $eligibleAssignments) {
@@ -354,7 +295,6 @@ if ($IncludePIM) {
                            -UnifiedRoleDefinitionId $roleDefId `
                            -ErrorAction SilentlyContinue
 
-            # Skip roles not in the target list
             if ($roleDef.DisplayName -notin $targetEntraRoles) { continue }
 
             $user = Get-MgUser -UserId $principalId `
@@ -393,9 +333,6 @@ else {
 # =============================================================================
 
 Write-Header "3/6  Microsoft Sentinel - Workspace RBAC"
-# NOTE: Defender XDR role filtering (previously in this section) has been
-# moved to Section 6 (XDR Complete RBAC) where it is part of the unified
-# access matrix. Section 3 now covers Sentinel workspace RBAC only.
 Write-Step "Processing Sentinel workspace RBAC..."
 
 if ($SentinelWorkspaces.Count -gt 0) {
@@ -416,7 +353,6 @@ if ($SentinelWorkspaces.Count -gt 0) {
     foreach ($ws in $SentinelWorkspaces) {
         $wsIndex++
 
-        # Validate all three required keys are present and non-empty
         if (-not $ws.WorkspaceId -or -not $ws.ResourceGroup -or -not $ws.SubscriptionId) {
             Write-Warn "Workspace $wsIndex skipped -- missing one or more required keys (WorkspaceId, ResourceGroup, SubscriptionId)"
             continue
@@ -429,7 +365,6 @@ if ($SentinelWorkspaces.Count -gt 0) {
         Write-Step "  Workspace $wsIndex/$($SentinelWorkspaces.Count): $wsId (RG: $wsRG, Sub: $wsSubId)"
 
         try {
-            # Switch to the correct subscription for this workspace
             Set-AzContext -SubscriptionId $wsSubId -ErrorAction Stop | Out-Null
 
             $sentinelScope = "/subscriptions/$wsSubId/resourceGroups/$wsRG"
@@ -438,15 +373,15 @@ if ($SentinelWorkspaces.Count -gt 0) {
                 Where-Object { $_.RoleDefinitionName -in $sentinelRoleNames } |
                 ForEach-Object {
                     [PSCustomObject]@{
-                        WorkspaceId      = $wsId
-                        ResourceGroup    = $wsRG
-                        SubscriptionId   = $wsSubId
-                        RoleName         = $_.RoleDefinitionName
-                        PrincipalName    = $_.DisplayName
-                        PrincipalType    = $_.ObjectType
-                        SignInName       = $_.SignInName
-                        Scope            = $_.Scope
-                        ExportedAt       = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                        WorkspaceId    = $wsId
+                        ResourceGroup  = $wsRG
+                        SubscriptionId = $wsSubId
+                        RoleName       = $_.RoleDefinitionName
+                        PrincipalName  = $_.DisplayName
+                        PrincipalType  = $_.ObjectType
+                        SignInName     = $_.SignInName
+                        Scope          = $_.Scope
+                        ExportedAt     = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
                     }
                 }
 
@@ -459,10 +394,8 @@ if ($SentinelWorkspaces.Count -gt 0) {
         }
     }
 
-    # Single combined export across all workspaces
     Export-Results -Data $allSentinelRoles -FileName "3_Sentinel_Workspace_Roles" -Format $ExportFormat
 
-    # Also export a per-workspace summary
     $sentinelSummary = $allSentinelRoles |
         Group-Object WorkspaceId |
         ForEach-Object {
@@ -479,13 +412,9 @@ if ($SentinelWorkspaces.Count -gt 0) {
     Export-Results -Data $sentinelSummary -FileName "3_Sentinel_Workspace_Summary" -Format $ExportFormat
     Write-OK "Total Sentinel role assignments across all workspaces: $($allSentinelRoles.Count)"
 
-    # =========================================================================
-    # 3b - Custom Permission Scan: Find any Azure role definitions that include
-    #      Sentinel/Log Analytics permissions and report who holds those roles
-    # =========================================================================
+    # 3b - Custom roles with Sentinel-relevant permissions
     Write-Step "3b - Scanning for custom/built-in roles with Sentinel-relevant permissions..."
 
-    # The specific permission actions to match against
     $sentinelPermissionActions = @(
         "Microsoft.SecurityInsights/*/read",
         "Microsoft.SecurityInsights/dataConnectorsCheckRequirements/action",
@@ -536,46 +465,33 @@ if ($SentinelWorkspaces.Count -gt 0) {
         try {
             Set-AzContext -SubscriptionId $wsSubId -ErrorAction Stop | Out-Null
 
-            $sentinelScope = "/subscriptions/$wsSubId/resourceGroups/$wsRG"
-
-            # Get ALL role assignments at this scope (not filtered by name)
+            $sentinelScope         = "/subscriptions/$wsSubId/resourceGroups/$wsRG"
             $allAssignmentsAtScope = Get-AzRoleAssignment -Scope $sentinelScope -ErrorAction Stop
 
             foreach ($ra in $allAssignmentsAtScope) {
 
-                # Skip roles already captured in the standard role list above
                 if ($ra.RoleDefinitionName -in $sentinelRoleNames) { continue }
 
-                # Fetch the full role definition to inspect its permissions.
-                # -WarningAction SilentlyContinue suppresses the Az 16.x breaking-change
-                # notice about flattened properties -- we already use Permissions[n].Actions
-                # and Permissions[n].DataActions which is the correct forward-compatible form.
                 try {
                     $roleDef = Get-AzRoleDefinition -Id $ra.RoleDefinitionId `
                                    -WarningAction SilentlyContinue `
                                    -ErrorAction SilentlyContinue
                     if (-not $roleDef) { continue }
 
-                    # Collect all actions and data actions via Permissions collection
-                    # (forward-compatible with Az 16.x -- avoids the deprecated flat properties)
                     $allActions = @()
                     foreach ($perm in $roleDef.Permissions) {
                         if ($perm.Actions)     { $allActions += @($perm.Actions) }
                         if ($perm.DataActions) { $allActions += @($perm.DataActions) }
                     }
 
-                    # Check if any of the role's actions match our target permissions
-                    # Supports wildcard matching (e.g. Microsoft.SecurityInsights/* matches Microsoft.SecurityInsights/incidents/read)
                     $matchedPermissions = @()
                     foreach ($targetAction in $sentinelPermissionActions) {
-                        # Convert the target action wildcard pattern to a regex
                         $pattern = "^" + [regex]::Escape($targetAction).Replace("\*", ".*") + "$"
                         foreach ($action in $allActions) {
                             if ($action -match $pattern -and $matchedPermissions -notcontains $targetAction) {
                                 $matchedPermissions += $targetAction
                             }
                         }
-                        # Also check if a wildcard action in the role covers the target (e.g. role has "Microsoft.SecurityInsights/*")
                         foreach ($action in $allActions) {
                             $actionPattern = "^" + [regex]::Escape($action).Replace("\*", ".*") + "$"
                             if ($targetAction -match $actionPattern -and $matchedPermissions -notcontains $targetAction) {
@@ -586,18 +502,18 @@ if ($SentinelWorkspaces.Count -gt 0) {
 
                     if ($matchedPermissions.Count -gt 0) {
                         $customPermissionRows += [PSCustomObject]@{
-                            WorkspaceId          = $wsId
-                            ResourceGroup        = $wsRG
-                            SubscriptionId       = $wsSubId
-                            RoleName             = $ra.RoleDefinitionName
-                            RoleType             = $roleDef.RoleType   # BuiltInRole or CustomRole
-                            PrincipalName        = $ra.DisplayName
-                            PrincipalType        = $ra.ObjectType
-                            SignInName           = $ra.SignInName
-                            Scope                = $ra.Scope
-                            MatchedPermissions   = ($matchedPermissions -join "; ")
-                            MatchedCount         = $matchedPermissions.Count
-                            ExportedAt           = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                            WorkspaceId        = $wsId
+                            ResourceGroup      = $wsRG
+                            SubscriptionId     = $wsSubId
+                            RoleName           = $ra.RoleDefinitionName
+                            RoleType           = $roleDef.RoleType
+                            PrincipalName      = $ra.DisplayName
+                            PrincipalType      = $ra.ObjectType
+                            SignInName         = $ra.SignInName
+                            Scope              = $ra.Scope
+                            MatchedPermissions = ($matchedPermissions -join "; ")
+                            MatchedCount       = $matchedPermissions.Count
+                            ExportedAt         = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
                         }
                     }
                 }
@@ -611,7 +527,7 @@ if ($SentinelWorkspaces.Count -gt 0) {
         }
     }
 
-    Write-OK "3b - Found $($customPermissionRows.Count) role assignment(s) with matching Sentinel permissions (outside standard roles)"
+    Write-OK "3b - Found $($customPermissionRows.Count) role assignment(s) with matching Sentinel permissions"
     Export-Results -Data $customPermissionRows -FileName "3b_Sentinel_CustomPermission_Assignments" -Format $ExportFormat
 }
 else {
@@ -639,15 +555,14 @@ if ($ScanDefenderForCloud) {
             Write-OK "Reusing existing Azure session: $($azContext.Account)"
         }
 
-        # Roles to capture for MDC-enabled subscriptions
         $mdcTargetRoles = @("Owner", "Contributor", "Security Admin")
 
         Write-Step "Enumerating all accessible subscriptions..."
         $allSubscriptions = Get-AzSubscription -ErrorAction Stop
         Write-OK "Found $($allSubscriptions.Count) subscription(s) in tenant"
 
-        $mdcSubScan   = @()   # One row per subscription scanned
-        $mdcRbacRows  = @()   # RBAC assignments from MDC-enabled subscriptions
+        $mdcSubScan  = @()
+        $mdcRbacRows = @()
 
         foreach ($sub in $allSubscriptions) {
             Write-Step "  Checking [$($sub.Name)] ($($sub.Id))..."
@@ -655,14 +570,12 @@ if ($ScanDefenderForCloud) {
             try {
                 Set-AzContext -SubscriptionId $sub.Id -ErrorAction Stop | Out-Null
 
-                # Get Defender for Cloud pricing tiers - Standard = MDC plan enabled
-                $pricingTiers   = Get-AzSecurityPricing -ErrorAction SilentlyContinue
-                $enabledPlans   = $pricingTiers |
+                $pricingTiers = Get-AzSecurityPricing -ErrorAction SilentlyContinue
+                $enabledPlans = $pricingTiers |
                                     Where-Object { $_.PricingTier -eq "Standard" } |
                                     Select-Object -ExpandProperty Name
-                $isMDCEnabled   = ($null -ne $enabledPlans -and $enabledPlans.Count -gt 0)
+                $isMDCEnabled = ($null -ne $enabledPlans -and $enabledPlans.Count -gt 0)
 
-                # Record the subscription scan result
                 $mdcSubScan += [PSCustomObject]@{
                     SubscriptionId   = $sub.Id
                     SubscriptionName = $sub.Name
@@ -676,9 +589,8 @@ if ($ScanDefenderForCloud) {
                 if ($isMDCEnabled) {
                     Write-OK "  MDC ENABLED: $($sub.Name) | Plans: $($enabledPlans -join ', ')"
 
-                    # Pull RBAC assignments for this subscription
-                    $subScope  = "/subscriptions/$($sub.Id)"
-                    $allRbac   = Get-AzRoleAssignment -Scope $subScope -ErrorAction SilentlyContinue
+                    $subScope = "/subscriptions/$($sub.Id)"
+                    $allRbac  = Get-AzRoleAssignment -Scope $subScope -ErrorAction SilentlyContinue
 
                     $matched = 0
                     foreach ($ra in $allRbac) {
@@ -720,10 +632,7 @@ if ($ScanDefenderForCloud) {
             }
         }
 
-        # Export subscription scan summary
         Export-Results -Data $mdcSubScan  -FileName "4_MDC_Subscription_Scan" -Format $ExportFormat
-
-        # Export RBAC rows from MDC-enabled subscriptions
         Export-Results -Data $mdcRbacRows -FileName "4_MDC_RBAC_Assignments"  -Format $ExportFormat
 
         $mdcCount = ($mdcSubScan | Where-Object MDCEnabled -eq $true).Count
@@ -751,7 +660,6 @@ if ($IncludePurview) {
     }
     else {
         Write-Step "Connecting to Purview / Security and Compliance Center..."
-        Write-Step "  (Uses ExchangeOnlineManagement module via Connect-IPPSSession)"
 
         try {
             Connect-IPPSSession -UserPrincipalName $PurviewAdminUPN -ErrorAction Stop
@@ -769,17 +677,18 @@ if ($IncludePurview) {
                 try {
                     $members = Get-RoleGroupMember -Identity $rg.Name -ErrorAction SilentlyContinue
 
-                    # Flatten the Roles collection to a readable string
+                    # $rg.Roles returns Exchange objects whose ToString() resolves to a DN path -- extract .Name explicitly
                     $roleList = ""
                     try {
                         $roleList = ($rg.Roles | ForEach-Object {
-                            if ($_ -is [string]) { $_ } else { $_.Name }
+                            if ($_ -is [string]) { ($_ -split "/")[-1] }
+                            elseif ($_.Name)     { $_.Name }
+                            else                 { ($_.ToString() -split "/")[-1] }
                         }) -join "; "
                     }
-                    catch { $roleList = $rg.Roles -join "; " }
+                    catch { $roleList = ($rg.Roles -join "; ") }
 
                     if (-not $members -or $members.Count -eq 0) {
-                        # Record empty role groups -- useful for clean-up review
                         $purviewMembers += [PSCustomObject]@{
                             RoleGroupName        = $rg.Name
                             RoleGroupDescription = $rg.Description
@@ -799,7 +708,7 @@ if ($IncludePurview) {
                                 RoleGroupType        = $rg.RoleGroupType
                                 AssignedRoles        = $roleList
                                 MemberDisplayName    = $m.DisplayName
-                                MemberUPN            = $m.WindowsLiveId
+                                MemberUPN            = if (-not [string]::IsNullOrWhiteSpace($m.WindowsLiveId)) { $m.WindowsLiveId } elseif (-not [string]::IsNullOrWhiteSpace($m.PrimarySmtpAddress)) { $m.PrimarySmtpAddress } else { $m.Name }
                                 MemberType           = $m.RecipientTypeDetails
                                 ExportedAt           = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
                             }
@@ -811,17 +720,18 @@ if ($IncludePurview) {
                 }
             }
 
-            # Full member export
+            # 5_Purview_RoleGroups.csv        -- one row per member
             Export-Results -Data $purviewMembers -FileName "5_Purview_RoleGroups" -Format $ExportFormat
 
-            # Summary - role group name, member count, assigned roles
+            # 5_Purview_RoleGroups_Summary.csv -- one row per role group with member UPN list
             $purviewSummary = $purviewMembers |
                 Group-Object RoleGroupName |
                 ForEach-Object {
-                    $realMembers = $_.Group | Where-Object { $_.MemberUPN -ne "" }
+                    $realMembers = $_.Group | Where-Object { -not [string]::IsNullOrWhiteSpace($_.MemberUPN) }
                     [PSCustomObject]@{
                         RoleGroupName   = $_.Name
                         MemberCount     = $realMembers.Count
+                        Members         = ($realMembers | Select-Object -ExpandProperty MemberUPN) -join "; "
                         AssignedRoles   = $_.Group[0].AssignedRoles
                         Description     = $_.Group[0].RoleGroupDescription
                     }
@@ -845,40 +755,14 @@ else {
     Write-Warn "Purview export skipped. Use -IncludePurview -PurviewAdminUPN 'admin@tenant.com' to enable."
 }
 
-# NOTE: Section 6 (XDR Complete RBAC) placeholder removed -- see below
-
-
 # =============================================================================
 # SECTION 6: Microsoft Defender XDR - Complete RBAC
-# (MDE custom roles + MDO email & collaboration + MDI via Entra + MCAS native roles)
-# Switch: -IncludeXDRRBAC
-# =============================================================================
-# What this section exports:
-#   7a - MDE Custom Roles          : All custom roles defined in MDE RBAC
-#                                    (Defender portal > Settings > Endpoints > Roles)
-#   7b - MDE Role Assignments      : Which users/groups are assigned each MDE role,
-#                                    with full user detail and group membership resolved
-#   7c - MDE Device Groups         : All device groups and their membership rules
-#                                    (used to scope what each MDE role can see)
-#   7d - MDE Role-to-DeviceGroup   : Cross-reference mapping which roles have access
-#                                    to which device groups (the full access matrix)
-#   7e - Entra Roles with MDE Access: From the Section 1 data, filters for only the
-#                                    Entra ID roles that grant MDE portal access
-#
-# API used: Security Graph beta endpoint (/beta/security/...)
-# Permission required: SecurityRolesAndAssignments.Read.All
-#
-# NOTE: If MDE custom RBAC is not enabled in your tenant, sections 7a-7d will
-# return empty results. Section 7e will always run regardless of MDE RBAC state.
 # =============================================================================
 
 if ($IncludeXDRRBAC) {
 
     Write-Header "6/6  Defender XDR - Complete RBAC Export"
 
-    # -------------------------------------------------------------------------
-    # Helper: Resolve group members (one level deep) for MDE role assignments
-    # -------------------------------------------------------------------------
     function Resolve-GroupMembersForMDE {
         param([string]$GroupId, [string]$GroupName)
         $resolved = @()
@@ -911,235 +795,235 @@ if ($IncludeXDRRBAC) {
         return $resolved
     }
 
-    # =========================================================================
-    # 7a - MDE Custom Roles
-    # =========================================================================
-    Write-Step "6a - MDE: Fetching custom RBAC roles..."
+    # Two tokens required:
+    #   wdatpToken : api.securitycenter.microsoft.com  (sections 6a-6d)
+    #   secToken   : api.security.microsoft.com        (section 6f Advanced Hunting)
+    $Script:wdatpToken = $null
+    $Script:secToken   = $null
 
-    $mdeRoles     = @()
-    $mdeRolesRaw  = @()
+    if ([string]::IsNullOrWhiteSpace($AppClientId) -or [string]::IsNullOrWhiteSpace($AppClientSecret)) {
+        Write-Warn "  No App Registration params supplied (-AppClientId / -AppClientSecret). Section 6 will be skipped."
+    }
+    else {
+        $resolvedTenant = if (-not [string]::IsNullOrWhiteSpace($AppTenantId)) { $AppTenantId } else { (Get-MgContext).TenantId }
+        Write-Step "  App Registration Tenant : $resolvedTenant"
+        Write-Step "  App Registration Client : $AppClientId"
 
-    try {
-        # Security Graph beta: GET /beta/security/roles
-        $rolesResponse = Invoke-MgGraphRequest `
-            -Method GET `
-            -Uri "https://graph.microsoft.com/beta/security/roles" `
-            -ErrorAction Stop
+        function Get-MdeToken {
+            param([string]$Scope)
+            try {
+                $r = Invoke-RestMethod -Method POST `
+                    -Uri  "https://login.microsoftonline.com/$resolvedTenant/oauth2/v2.0/token" `
+                    -Body @{ grant_type = "client_credentials"; client_id = $AppClientId; client_secret = $AppClientSecret; scope = $Scope } `
+                    -ErrorAction Stop
+                return $r.access_token
+            }
+            catch {
+                Write-Warn "    Token request failed for scope '$Scope': $_"
+                return $null
+            }
+        }
 
-        $mdeRolesRaw = $rolesResponse.value
+        Write-Step "  Acquiring WDATP token  (api.securitycenter.microsoft.com)..."
+        $Script:wdatpToken = Get-MdeToken -Scope "https://api.securitycenter.microsoft.com/.default"
+        if ($Script:wdatpToken) { Write-OK "  WDATP token acquired" } else { Write-Warn "  WDATP token failed -- sections 6a/6b/6c/6d will be skipped." }
+
+        Write-Step "  Acquiring XDR Security token (api.security.microsoft.com)..."
+        $Script:secToken = Get-MdeToken -Scope "https://api.security.microsoft.com/.default"
+        if ($Script:secToken) { Write-OK "  XDR Security token acquired" } else { Write-Warn "  XDR Security token failed -- section 6f Advanced Hunting will be skipped." }
+    }
+
+    function Invoke-MdeApi {
+        param([string]$Uri, [string]$Token)
+        if (-not $Token) { Write-Warn "  No token available for: $Uri"; return @() }
+        $hdrs = @{ Authorization = "Bearer $Token"; "Content-Type" = "application/json" }
+        $all  = @()
+        $next = $Uri
+        do {
+            try {
+                $r    = Invoke-RestMethod -Method GET -Uri $next -Headers $hdrs -ErrorAction Stop
+                $vals = if ($r.value) { $r.value } elseif ($r.Results) { $r.Results } else { @() }
+                $all += $vals
+                $next = $r.'@odata.nextLink'
+            }
+            catch { Write-Warn "    MDE API call failed ($next): $_"; break }
+        } while ($next)
+        return $all
+    }
+
+    # -------------------------------------------------------------------------
+    # 6a - MDE Custom Roles
+    # -------------------------------------------------------------------------
+    Write-Step "6a - MDE: Fetching custom roles (Settings > Endpoints > Roles)..."
+
+    $mdeRoles    = @()
+    $mdeRolesRaw = @()
+
+    if (-not $Script:wdatpToken) {
+        Write-Warn "  6a - Skipped: no WDATP token."
+    }
+    else {
+        $mdeRolesRaw = Invoke-MdeApi -Uri "https://api.security.microsoft.com/api/roles" -Token $Script:wdatpToken
 
         if ($mdeRolesRaw.Count -eq 0) {
-            Write-Warn "  No MDE custom roles returned. MDE custom RBAC may not be enabled."
-            Write-Warn "  To enable: Defender portal > Settings > Endpoints > Roles > Turn on roles"
+            Write-Warn "  6a - No MDE custom roles returned. Expected for tenants using XDR Unified RBAC (post Feb 2025)."
         }
         else {
             foreach ($role in $mdeRolesRaw) {
-                $permissionNames = ($role.permissions | ForEach-Object { $_.allowedResourceActions }) -join "; "
-
                 $mdeRoles += [PSCustomObject]@{
-                    RoleId              = $role.id
-                    RoleDisplayName     = $role.displayName
-                    RoleDescription     = $role.description
-                    IsEnabled           = $role.isEnabled
-                    PermissionCount     = ($role.permissions | Measure-Object).Count
-                    Permissions         = $permissionNames
-                    ExportedAt          = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                    RoleId          = $role.id
+                    RoleDisplayName = $role.name
+                    RoleDescription = $role.description
+                    IsEnabled       = $role.enabled
+                    Permissions     = ($role.permissions -join "; ")
+                    AssignedGroups  = ($role.roleGroups | ForEach-Object { $_.name }) -join "; "
+                    ExportedAt      = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
                 }
             }
-            Write-OK "Found $($mdeRoles.Count) MDE custom roles"
+            Write-OK "  6a - Found $($mdeRoles.Count) MDE custom role(s)"
         }
-    }
-    catch {
-        Write-Warn "  Could not retrieve MDE custom roles: $_"
-        Write-Warn "  Ensure SecurityRolesAndAssignments.Read.All permission is consented."
     }
 
     Export-Results -Data $mdeRoles -FileName "6a_MDE_CustomRoles" -Format $ExportFormat
 
-    # =========================================================================
-    # 7b - MDE Role Assignments (who is assigned to each role)
-    # =========================================================================
+    # -------------------------------------------------------------------------
+    # 6b - MDE Role Assignments
+    # -------------------------------------------------------------------------
     Write-Step "6b - MDE: Fetching role assignments..."
 
     $mdeRoleAssignments = @()
 
-    try {
-        # Security Graph beta: GET /beta/security/roleAssignments
-        $assignmentsResponse = Invoke-MgGraphRequest `
-            -Method GET `
-            -Uri "https://graph.microsoft.com/beta/security/roleAssignments" `
-            -ErrorAction Stop
+    if (-not $Script:wdatpToken) {
+        Write-Warn "  6b - Skipped: no WDATP token."
+    }
+    else {
+        try {
+            if ($mdeRolesRaw.Count -eq 0) {
+                Write-Warn "  6b - No roles from 6a to expand."
+            }
+            else {
+                foreach ($role in $mdeRolesRaw) {
+                    $roleName = $role.name
 
-        $rawAssignments = $assignmentsResponse.value
+                    if (-not $role.roleGroups -or $role.roleGroups.Count -eq 0) {
+                        $mdeRoleAssignments += [PSCustomObject]@{
+                            AssignmentId    = ""
+                            RoleId          = $role.id
+                            RoleDisplayName = $roleName
+                            AssignedToType  = "(No groups assigned)"
+                            AssignedToName  = ""
+                            AssignedToUPN   = ""
+                            AssignedToMail  = ""
+                            Department      = ""
+                            JobTitle        = ""
+                            AccountEnabled  = ""
+                            PrincipalId     = ""
+                            DeviceGroupIds  = ""
+                            ExportedAt      = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                        }
+                        continue
+                    }
 
-        if ($rawAssignments.Count -eq 0) {
-            Write-Warn "  No MDE role assignments returned."
-        }
-        else {
-            foreach ($assignment in $rawAssignments) {
-
-                # Match the role name from 7a data
-                $matchedRole = $mdeRolesRaw | Where-Object { $_.id -eq $assignment.roleDefinitionId }
-                $roleName    = if ($matchedRole) { $matchedRole.displayName } else { $assignment.roleDefinitionId }
-
-                # Each assignment has a list of principalIds (users or groups)
-                foreach ($principalId in $assignment.principalIds) {
-
-                    # Try to resolve as a user first
-                    $resolved = $null
-                    $memberType = "Unknown"
-
-                    try {
-                        $u = Get-MgUser -UserId $principalId `
-                                -Property "DisplayName,UserPrincipalName,Mail,AccountEnabled,Department,JobTitle" `
-                                -ErrorAction Stop
+                    foreach ($rg in $role.roleGroups) {
+                        $groupId   = $rg.id
+                        $groupName = $rg.name
 
                         $mdeRoleAssignments += [PSCustomObject]@{
-                            AssignmentId        = $assignment.id
-                            RoleId              = $assignment.roleDefinitionId
-                            RoleDisplayName     = $roleName
-                            AssignedToType      = "User"
-                            AssignedToName      = $u.DisplayName
-                            AssignedToUPN       = $u.UserPrincipalName
-                            AssignedToMail      = $u.Mail
-                            Department          = $u.Department
-                            JobTitle            = $u.JobTitle
-                            AccountEnabled      = $u.AccountEnabled
-                            PrincipalId         = $principalId
-                            DeviceGroupIds      = ($assignment.appScopeIds -join "; ")
-                            ExportedAt          = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                            AssignmentId    = $role.id
+                            RoleId          = $role.id
+                            RoleDisplayName = $roleName
+                            AssignedToType  = "Group"
+                            AssignedToName  = $groupName
+                            AssignedToUPN   = ""
+                            AssignedToMail  = ""
+                            Department      = ""
+                            JobTitle        = ""
+                            AccountEnabled  = ""
+                            PrincipalId     = $groupId
+                            DeviceGroupIds  = ""
+                            ExportedAt      = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
                         }
-                        $memberType = "User"
-                    }
-                    catch {
-                        # Not a user -- try as group
-                        try {
-                            $g = Get-MgGroup -GroupId $principalId `
-                                    -Property "DisplayName,Mail" `
-                                    -ErrorAction Stop
 
+                        $groupMembers = Resolve-GroupMembersForMDE -GroupId $groupId -GroupName $groupName
+                        foreach ($gm in $groupMembers) {
                             $mdeRoleAssignments += [PSCustomObject]@{
-                                AssignmentId        = $assignment.id
-                                RoleId              = $assignment.roleDefinitionId
-                                RoleDisplayName     = $roleName
-                                AssignedToType      = "Group"
-                                AssignedToName      = $g.DisplayName
-                                AssignedToUPN       = $g.Mail
-                                AssignedToMail      = $g.Mail
-                                Department          = ""
-                                JobTitle            = ""
-                                AccountEnabled      = $true
-                                PrincipalId         = $principalId
-                                DeviceGroupIds      = ($assignment.appScopeIds -join "; ")
-                                ExportedAt          = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                                AssignmentId    = $role.id
+                                RoleId          = $role.id
+                                RoleDisplayName = $roleName
+                                AssignedToType  = $gm.MemberType
+                                AssignedToName  = $gm.MemberDisplayName
+                                AssignedToUPN   = $gm.MemberUPN
+                                AssignedToMail  = $gm.MemberMail
+                                Department      = $gm.Department
+                                JobTitle        = $gm.JobTitle
+                                AccountEnabled  = $gm.AccountEnabled
+                                PrincipalId     = $gm.MemberId
+                                DeviceGroupIds  = ""
+                                ExportedAt      = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
                             }
-
-                            # Resolve group members one level deep
-                            $groupMembers = Resolve-GroupMembersForMDE -GroupId $principalId -GroupName $g.DisplayName
-                            foreach ($gm in $groupMembers) {
-                                $mdeRoleAssignments += [PSCustomObject]@{
-                                    AssignmentId        = $assignment.id
-                                    RoleId              = $assignment.roleDefinitionId
-                                    RoleDisplayName     = $roleName
-                                    AssignedToType      = $gm.MemberType
-                                    AssignedToName      = $gm.MemberDisplayName
-                                    AssignedToUPN       = $gm.MemberUPN
-                                    AssignedToMail      = $gm.MemberMail
-                                    Department          = $gm.Department
-                                    JobTitle            = $gm.JobTitle
-                                    AccountEnabled      = $gm.AccountEnabled
-                                    PrincipalId         = $gm.MemberId
-                                    DeviceGroupIds      = ($assignment.appScopeIds -join "; ")
-                                    ExportedAt          = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-                                }
-                            }
-                            $memberType = "Group"
-                        }
-                        catch {
-                            Write-Warn "  Could not resolve principal $principalId : $_"
                         }
                     }
                 }
+                Write-OK "  6b - $($mdeRoleAssignments.Count) MDE role assignment entries (incl. group expansion)"
             }
-            Write-OK "Found $($mdeRoleAssignments.Count) MDE role assignment entries (including group member expansion)"
         }
-    }
-    catch {
-        Write-Warn "  Could not retrieve MDE role assignments: $_"
+        catch {
+            Write-Warn "  6b - Failed to build role assignments: $_"
+        }
     }
 
     Export-Results -Data $mdeRoleAssignments -FileName "6b_MDE_RoleAssignments" -Format $ExportFormat
 
-    # =========================================================================
-    # 7c - MDE Device Groups
-    # =========================================================================
+    # -------------------------------------------------------------------------
+    # 6c - MDE Device Groups
+    # -------------------------------------------------------------------------
     Write-Step "6c - MDE: Fetching device groups..."
 
     $mdeDeviceGroups    = @()
     $mdeDeviceGroupsRaw = @()
 
-    # The MDE device group API is available via the MDE/WDATP REST API.
-    # Use Invoke-MgGraphRequest with the securitycenter endpoint.
-    try {
-        $machineGroupsUri = "https://api.securitycenter.microsoft.com/api/machinegroups"
-
-        # Note: This endpoint requires WindowsDefenderATP permission scope.
-        # If the Graph token does not have this scope, we catch and warn.
-        $mgResponse = Invoke-MgGraphRequest `
-            -Method GET `
-            -Uri $machineGroupsUri `
-            -ErrorAction Stop
-
-        $mdeDeviceGroupsRaw = $mgResponse.value
-
-        foreach ($dg in $mdeDeviceGroupsRaw) {
-            $mdeDeviceGroups += [PSCustomObject]@{
-                DeviceGroupId           = $dg.id
-                DeviceGroupName         = $dg.name
-                Description             = $dg.description
-                IsUnassigned            = $dg.isUnassigned
-                Rank                    = $dg.rank
-                RemediationLevel        = $dg.remediationLevel
-                MachineCount            = $dg.machineCount
-                ExportedAt              = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-            }
-        }
-
-        Write-OK "Found $($mdeDeviceGroups.Count) MDE device groups"
-    }
-    catch {
-        Write-Warn "  MDE device groups API not reachable via current token scope."
-        Write-Warn "  To retrieve device groups, the account needs Machine.Read.All permission"
-        Write-Warn "  on the WindowsDefenderATP enterprise application, or use the MDE API directly."
-        Write-Warn "  Placeholder rows will be written to the output for reference."
-
-        # Write a descriptive placeholder so the output file is not silently empty
+    if (-not $Script:wdatpToken) {
+        Write-Warn "  6c - Skipped: no WDATP token."
         $mdeDeviceGroups += [PSCustomObject]@{
-            DeviceGroupId     = "REQUIRES_MDE_API_PERMISSION"
-            DeviceGroupName   = "See notes -- Machine.Read.All required on WindowsDefenderATP app"
-            Description       = "Use Defender portal > Settings > Endpoints > Device groups to view manually"
-            IsUnassigned      = ""
-            Rank              = ""
-            RemediationLevel  = ""
-            MachineCount      = ""
-            ExportedAt        = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+            DeviceGroupId   = "NO_TOKEN"; DeviceGroupName = "Provide -AppClientId / -AppClientSecret to retrieve device groups"
+            Description     = ""; IsUnassigned = ""; Rank = ""; RemediationLevel = ""; MachineCount = ""
+            ExportedAt      = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+        }
+    }
+    else {
+        $mdeDeviceGroupsRaw = Invoke-MdeApi -Uri "https://api.security.microsoft.com/api/machinegroups" -Token $Script:wdatpToken
+
+        if ($mdeDeviceGroupsRaw.Count -eq 0) {
+            Write-Warn "  6c - No device groups returned. Verify Machine.Read.All (Application) has Admin Consent."
+        }
+        else {
+            foreach ($dg in $mdeDeviceGroupsRaw) {
+                $mdeDeviceGroups += [PSCustomObject]@{
+                    DeviceGroupId    = $dg.id
+                    DeviceGroupName  = $dg.name
+                    Description      = $dg.description
+                    IsUnassigned     = $dg.isUnassigned
+                    Rank             = $dg.rank
+                    RemediationLevel = $dg.remediationLevel
+                    MachineCount     = $dg.machineCount
+                    ExportedAt       = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                }
+            }
+            Write-OK "  6c - Found $($mdeDeviceGroups.Count) device group(s)"
         }
     }
 
     Export-Results -Data $mdeDeviceGroups -FileName "6c_MDE_DeviceGroups" -Format $ExportFormat
 
-    # =========================================================================
-    # 7d - MDE Role-to-DeviceGroup Access Matrix
-    # Cross-reference: for each MDE role assignment, which device groups can
-    # that user/group see? This is the most operationally useful output.
-    # =========================================================================
+    # -------------------------------------------------------------------------
+    # 6d - MDE Role-to-DeviceGroup Access Matrix
+    # -------------------------------------------------------------------------
     Write-Step "6d - MDE: Building Role-to-DeviceGroup access matrix..."
 
     $mdeAccessMatrix = @()
 
     if ($mdeRoleAssignments.Count -gt 0) {
 
-        # Get unique assignments (role + principal + device group scope)
         $uniqueAssignments = $mdeRoleAssignments |
             Select-Object AssignmentId, RoleDisplayName, AssignedToName, AssignedToUPN,
                           AssignedToType, Department, AccountEnabled, DeviceGroupIds |
@@ -1147,16 +1031,13 @@ if ($IncludeXDRRBAC) {
 
         foreach ($ua in $uniqueAssignments) {
 
-            # DeviceGroupIds is a semicolon-separated list of appScopeIds
-            # An empty or null DeviceGroupIds means the role has access to ALL device groups
-            if ([string]::IsNullOrWhiteSpace($ua.DeviceGroupIds) -or $ua.DeviceGroupIds -eq "") {
+            if ([string]::IsNullOrWhiteSpace($ua.DeviceGroupIds)) {
                 $deviceGroupScope = "ALL DEVICE GROUPS (unrestricted)"
                 $deviceGroupNames = "ALL DEVICE GROUPS"
             }
             else {
-                # Resolve device group IDs to names using 7c data
-                $dgIds    = $ua.DeviceGroupIds -split ";" | ForEach-Object { $_.Trim() }
-                $dgNames  = foreach ($dgId in $dgIds) {
+                $dgIds   = $ua.DeviceGroupIds -split ";" | ForEach-Object { $_.Trim() }
+                $dgNames = foreach ($dgId in $dgIds) {
                     $matchedDG = $mdeDeviceGroupsRaw | Where-Object { $_.id -eq $dgId }
                     if ($matchedDG) { $matchedDG.name } else { "ID:$dgId" }
                 }
@@ -1165,16 +1046,16 @@ if ($IncludeXDRRBAC) {
             }
 
             $mdeAccessMatrix += [PSCustomObject]@{
-                RoleDisplayName     = $ua.RoleDisplayName
-                AssignedToName      = $ua.AssignedToName
-                AssignedToUPN       = $ua.AssignedToUPN
-                AssignedToType      = $ua.AssignedToType
-                Department          = $ua.Department
-                AccountEnabled      = $ua.AccountEnabled
-                DeviceGroupScope    = $deviceGroupScope
-                DeviceGroupNames    = $deviceGroupNames
-                AccessLevel         = if ($deviceGroupNames -like "*ALL*") { "FULL TENANT ACCESS" } else { "SCOPED ACCESS" }
-                ExportedAt          = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                RoleDisplayName  = $ua.RoleDisplayName
+                AssignedToName   = $ua.AssignedToName
+                AssignedToUPN    = $ua.AssignedToUPN
+                AssignedToType   = $ua.AssignedToType
+                Department       = $ua.Department
+                AccountEnabled   = $ua.AccountEnabled
+                DeviceGroupScope = $deviceGroupScope
+                DeviceGroupNames = $deviceGroupNames
+                AccessLevel      = if ($deviceGroupNames -like "*ALL*") { "FULL TENANT ACCESS" } else { "SCOPED ACCESS" }
+                ExportedAt       = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
             }
         }
 
@@ -1182,19 +1063,15 @@ if ($IncludeXDRRBAC) {
     }
     else {
         Write-Warn "  No MDE role assignments available to build access matrix."
-        Write-Warn "  This is expected if MDE custom RBAC is not yet enabled."
     }
 
     Export-Results -Data $mdeAccessMatrix -FileName "6d_MDE_AccessMatrix" -Format $ExportFormat
 
-    # =========================================================================
-    # 7e - Entra ID Roles with MDE Portal Access
-    # Filters the Section 1 output for roles that grant MDE access.
-    # This runs regardless of whether MDE custom RBAC is enabled.
-    # =========================================================================
+    # -------------------------------------------------------------------------
+    # 6e - Entra ID Roles with MDE/XDR Portal Access
+    # -------------------------------------------------------------------------
     Write-Step "6e - MDI/XDR: Filtering Entra ID roles with XDR product access..."
 
-    # These Entra ID roles grant access to the Defender portal / MDE functionality
     $mdeRelevantEntraRoles = @(
         "Global Administrator",
         "Security Administrator",
@@ -1202,8 +1079,8 @@ if ($IncludeXDRRBAC) {
         "Security Operator",
         "Compliance Administrator",
         "Global Reader",
-        "Helpdesk Administrator",     # can manage devices in MDE
-        "Intune Administrator"         # device management overlap with MDE
+        "Helpdesk Administrator",
+        "Intune Administrator"
     )
 
     $mdeEntraAccess = @()
@@ -1212,16 +1089,8 @@ if ($IncludeXDRRBAC) {
         $mdeEntraAccess = $entraRoleAssignments |
             Where-Object { $_.RoleName -in $mdeRelevantEntraRoles } |
             Select-Object `
-                RoleName,
-                MemberType,
-                MemberDisplayName,
-                MemberUPN,
-                MemberMail,
-                MemberDepartment,
-                MemberJobTitle,
-                AccountEnabled,
-                UserType,
-                AssignmentType,
+                RoleName, MemberType, MemberDisplayName, MemberUPN, MemberMail,
+                MemberDepartment, MemberJobTitle, AccountEnabled, UserType, AssignmentType,
                 @{ Name="MDEAccessLevel"; Expression={
                     switch ($_.RoleName) {
                         "Global Administrator"    { "Full MDE Access (all features, all settings)" }
@@ -1245,37 +1114,137 @@ if ($IncludeXDRRBAC) {
 
     Export-Results -Data $mdeEntraAccess -FileName "6e_XDR_EntraRoles_Access" -Format $ExportFormat
 
-    # =========================================================================
-    # 7 - Summary
-    # =========================================================================
+    # -------------------------------------------------------------------------
+    # 6f - MDE RBAC Identity Audit via Advanced Hunting (KQL)
+    # Queries IdentityInfo for identities with Entra roles or group memberships.
+    # Cross-references Section 1 to flag blind spots.
+    # -------------------------------------------------------------------------
+    Write-Step "6f - MDE Identity Audit via Advanced Hunting (KQL)..."
+
+    $mdeIdentityAudit   = @()
+    $mdeAuditBlindSpots = @()
+
+    $entraKnownUPNs_6f = @()
+    if ($entraRoleAssignments.Count -gt 0) {
+        $entraKnownUPNs_6f = $entraRoleAssignments |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_.MemberUPN) } |
+            Select-Object -ExpandProperty MemberUPN -Unique
+    }
+
+    try {
+        if (-not $Script:secToken) {
+            Write-Warn "  6f - Skipped: no XDR Security token."
+            Write-Warn "  Ensure AdvancedHunting.Read.All (Application) is granted on Microsoft Threat Protection."
+        }
+        else {
+            $kqlQuery = @'
+IdentityInfo
+| where isnotempty(AssignedRoles) or isnotempty(GroupMembership)
+| summarize arg_max(Timestamp, *) by AccountObjectId
+| project AccountUpn, AccountDisplayName, AccountObjectId, Department, JobTitle,
+          IsAccountEnabled, AssignedRoles, GroupMembership, RiskLevel, BlastRadius, IdentityEnvironment
+| order by AccountDisplayName asc
+'@
+
+            $body = @{ Query = $kqlQuery } | ConvertTo-Json
+            $hdrs = @{ Authorization = "Bearer $($Script:secToken)"; "Content-Type" = "application/json" }
+
+            Write-Step "  Submitting Advanced Hunting query to IdentityInfo table..."
+            $ahResult = $null
+            try {
+                $ahResult = Invoke-RestMethod -Method POST `
+                    -Uri     "https://api.security.microsoft.com/api/advancedhunting/run" `
+                    -Headers $hdrs -Body $body -ErrorAction Stop
+            }
+            catch {
+                Write-Warn "  6f - Advanced Hunting query failed: $_"
+                Write-Warn "  Verify AdvancedHunting.Read.All is granted and admin consent applied."
+            }
+
+            if ($ahResult -and $ahResult.Results -and $ahResult.Results.Count -gt 0) {
+                Write-OK "  6f - Advanced Hunting returned $($ahResult.Results.Count) identity record(s)"
+
+                foreach ($identity in $ahResult.Results) {
+
+                    $rolesStr    = if ($identity.AssignedRoles)   { ($identity.AssignedRoles   | ForEach-Object { $_ }) -join "; " } else { "" }
+                    $groupsStr   = if ($identity.GroupMembership) { ($identity.GroupMembership | ForEach-Object { $_ }) -join "; " } else { "" }
+                    $isBlindSpot = ($identity.AccountUpn -notin $entraKnownUPNs_6f) -and (-not [string]::IsNullOrWhiteSpace($identity.AccountUpn))
+
+                    $row = [PSCustomObject]@{
+                        AccountUPN           = $identity.AccountUpn
+                        DisplayName          = $identity.AccountDisplayName
+                        AccountObjectId      = $identity.AccountObjectId
+                        Department           = $identity.Department
+                        JobTitle             = $identity.JobTitle
+                        IsAccountEnabled     = $identity.IsAccountEnabled
+                        AssignedEntraRoles   = $rolesStr
+                        EntraGroupMembership = $groupsStr
+                        RiskLevel            = $identity.RiskLevel
+                        BlastRadius          = $identity.BlastRadius
+                        IdentityEnvironment  = $identity.IdentityEnvironment
+                        InSection1Export     = if ($isBlindSpot) { "NO - NOT IN ENTRA ROLE EXPORT" } else { "Yes" }
+                        BlindSpotFlag        = if ($isBlindSpot) { "REVIEW REQUIRED" } else { "" }
+                        ExportedAt           = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                    }
+
+                    $mdeIdentityAudit += $row
+                    if ($isBlindSpot) { $mdeAuditBlindSpots += $row }
+                }
+
+                Write-OK "  6f - Identity audit complete: $($mdeIdentityAudit.Count) identities, $($mdeAuditBlindSpots.Count) blind spot(s)"
+                Write-Host ""
+                Write-Host "  6f Advanced Hunting Identity Audit Results:" -ForegroundColor Cyan
+                Write-Host "  --------------------------------------------" -ForegroundColor Cyan
+                Write-Host "  Identities with roles or group memberships : $($mdeIdentityAudit.Count)" -ForegroundColor White
+                Write-Host "  Not present in Section 1 Entra role export : $($mdeAuditBlindSpots.Count)" -ForegroundColor $(if ($mdeAuditBlindSpots.Count -gt 0) { "Red" } else { "Green" })
+                Write-Host ""
+
+                if ($mdeAuditBlindSpots.Count -gt 0) {
+                    Write-Warn "  ACTION REQUIRED: $($mdeAuditBlindSpots.Count) identities have Entra roles or group memberships"
+                    Write-Warn "  but do not appear in Section 1. Review '6f_MDE_BlindSpots'."
+                }
+                else {
+                    Write-OK "  No blind spots detected -- all identities with roles/groups are covered in Section 1."
+                }
+            }
+            else {
+                Write-Warn "  6f - No results from Advanced Hunting. Verify Defender for Identity or Entra ID connector is active."
+            }
+        }
+    }
+    catch {
+        Write-Warn "  6f - Advanced Hunting section failed: $_"
+    }
+
+    Export-Results -Data $mdeIdentityAudit  -FileName "6f_MDE_IdentityAudit" -Format $ExportFormat
+    Export-Results -Data $mdeAuditBlindSpots -FileName "6f_MDE_BlindSpots"    -Format $ExportFormat
+
     Write-Host ""
     Write-Host "  XDR Complete RBAC Export Summary" -ForegroundColor Cyan
     Write-Host "  --------------------------------" -ForegroundColor Cyan
-    Write-Host "  6a  MDE Custom Roles          : $($mdeRoles.Count) roles" -ForegroundColor White
-    Write-Host "  6b  MDE Role Assignments       : $($mdeRoleAssignments.Count) entries (incl. group expansion)" -ForegroundColor White
-    Write-Host "  6c  MDE Device Groups          : $($mdeDeviceGroups.Count) groups" -ForegroundColor White
-    Write-Host "  6d  Role-to-DeviceGroup Matrix : $($mdeAccessMatrix.Count) mappings" -ForegroundColor White
-    Write-Host "  6e  Entra Roles with XDR Access: $($mdeEntraAccess.Count) assignments" -ForegroundColor White
+    Write-Host "  6a  MDE Custom Roles              : $($mdeRoles.Count) roles" -ForegroundColor White
+    Write-Host "  6b  MDE Role Assignments           : $($mdeRoleAssignments.Count) entries" -ForegroundColor White
+    Write-Host "  6c  MDE Device Groups              : $($mdeDeviceGroups.Count) groups" -ForegroundColor White
+    Write-Host "  6d  Role-to-DeviceGroup Matrix     : $($mdeAccessMatrix.Count) mappings" -ForegroundColor White
+    Write-Host "  6e  Entra Roles with MDE Access    : $($mdeEntraAccess.Count) assignments" -ForegroundColor White
+    Write-Host "  6f  Advanced Hunting Identity Audit: $($mdeIdentityAudit.Count) identities | $($mdeAuditBlindSpots.Count) blind spot(s)" -ForegroundColor $(if ($mdeAuditBlindSpots.Count -gt 0) { "Red" } else { "White" })
     Write-Host ""
 
     if ($mdeRoles.Count -eq 0 -and $mdeRoleAssignments.Count -eq 0) {
-        Write-Warn "  IMPORTANT: Zero MDE custom roles/assignments found."
-        Write-Warn "  This typically means MDE custom RBAC is NOT enabled in your tenant."
-        Write-Warn "  In this state, MDE access is controlled purely by Entra ID roles (see 6e output)."
-        Write-Warn "  To enable MDE custom RBAC: Defender portal > Settings > Endpoints > Roles"
+        Write-Warn "  Sections 6a/6b returned 0 roles -- expected for XDR Unified RBAC tenants (post Feb 2025)."
+        Write-Warn "  MDE access is controlled via Entra ID roles (see 6e) and group memberships (see 6f)."
     }
 }
 else {
     Write-Warn "XDR RBAC export skipped. Use -IncludeXDRRBAC to enable."
-    Write-Warn "Note: Without MDE custom RBAC enabled, access is controlled by Entra ID roles only."
-    Write-Warn "The Section 1 output (1_EntraID_RoleAssignments.csv) contains all relevant role data."
+    Write-Warn "Without MDE custom RBAC, access is controlled by Entra ID roles (see 1_EntraID_Roles)."
 }
 
 # =============================================================================
-# Summary
+# Final Summary
 # =============================================================================
 
-Write-Header "6/6  Export Complete"
+Write-Header "Export Complete"
 
 $files = Get-ChildItem -Path $OutputPath -File
 Write-Host ""
@@ -1296,9 +1265,11 @@ $manifest = [PSCustomObject]@{
     IncludedPurview         = $IncludePurview.IsPresent
     IncludedXDRRBAC         = $IncludeXDRRBAC.IsPresent
     EntraRoleCount          = $entraRoleAssignments.Count
-    MDECustomRoleCount      = if ($IncludeXDRRBAC) { $mdeRoles.Count } else { "skipped" }
+    MDECustomRoleCount      = if ($IncludeXDRRBAC) { $mdeRoles.Count }           else { "skipped" }
+    MDEIdentityAuditCount   = if ($IncludeXDRRBAC) { $mdeIdentityAudit.Count }   else { "skipped" }
+    MDEBlindSpotCount       = if ($IncludeXDRRBAC) { $mdeAuditBlindSpots.Count } else { "skipped" }
     MDEAssignmentCount      = if ($IncludeXDRRBAC) { $mdeRoleAssignments.Count } else { "skipped" }
-    MDEEntraAccessCount     = if ($IncludeXDRRBAC) { $mdeEntraAccess.Count } else { "skipped" }
+    MDEEntraAccessCount     = if ($IncludeXDRRBAC) { $mdeEntraAccess.Count }     else { "skipped" }
     FilesGenerated          = $files.Count
 }
 
