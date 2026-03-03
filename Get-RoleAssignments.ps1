@@ -164,8 +164,13 @@ $targetEntraRoles = @(
     "Global Administrator",
     "Security Administrator",
     "Security Operator",
+    "Security Reader",
     "Global Reader",
-    "Security Reader"
+    "Compliance Administrator",
+    "Compliance Data Administrator",
+    "Information Protection Administrator",
+    "Helpdesk Administrator",
+    "Intune Administrator"
 )
 
 $entraRoleAssignments = @()
@@ -208,6 +213,26 @@ try {
                             UserType          = $u.UserType
                             MemberId          = $member.Id
                             AssignmentType    = "Active"
+                            MDEAccessLevel    = switch ($role.DisplayName) {
+                                "Global Administrator"    { "Full MDE Access" }
+                                "Security Administrator"  { "Full MDE Read/Write" }
+                                "Security Operator"       { "MDE Response Actions" }
+                                "Security Reader"         { "MDE Read Only" }
+                                "Global Reader"           { "MDE Read Only" }
+                                "Helpdesk Administrator"  { "MDE Device Management" }
+                                "Intune Administrator"    { "MDE Device Management" }
+                                default                   { "-" }
+                            }
+                            PurviewAccessLevel = switch ($role.DisplayName) {
+                                "Global Administrator"                { "Full Purview Access" }
+                                "Compliance Administrator"            { "Full Compliance Center" }
+                                "Compliance Data Administrator"       { "Read/Write Compliance Data" }
+                                "Security Administrator"              { "Read Purview Alerts" }
+                                "Security Reader"                     { "Read Only" }
+                                "Global Reader"                       { "Read Only" }
+                                "Information Protection Administrator" { "Sensitivity Labels & DLP" }
+                                default                               { "-" }
+                            }
                             ExportedAt        = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
                         }
                     }
@@ -231,6 +256,26 @@ try {
                             UserType          = "Group"
                             MemberId          = $member.Id
                             AssignmentType    = "Active"
+                            MDEAccessLevel    = switch ($role.DisplayName) {
+                                "Global Administrator"    { "Full MDE Access" }
+                                "Security Administrator"  { "Full MDE Read/Write" }
+                                "Security Operator"       { "MDE Response Actions" }
+                                "Security Reader"         { "MDE Read Only" }
+                                "Global Reader"           { "MDE Read Only" }
+                                "Helpdesk Administrator"  { "MDE Device Management" }
+                                "Intune Administrator"    { "MDE Device Management" }
+                                default                   { "-" }
+                            }
+                            PurviewAccessLevel = switch ($role.DisplayName) {
+                                "Global Administrator"                { "Full Purview Access" }
+                                "Compliance Administrator"            { "Full Compliance Center" }
+                                "Compliance Data Administrator"       { "Read/Write Compliance Data" }
+                                "Security Administrator"              { "Read Purview Alerts" }
+                                "Security Reader"                     { "Read Only" }
+                                "Global Reader"                       { "Read Only" }
+                                "Information Protection Administrator" { "Sensitivity Labels & DLP" }
+                                default                               { "-" }
+                            }
                             ExportedAt        = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
                         }
                     }
@@ -252,6 +297,26 @@ try {
                             UserType          = "ServicePrincipal"
                             MemberId          = $member.Id
                             AssignmentType    = "Active"
+                            MDEAccessLevel    = switch ($role.DisplayName) {
+                                "Global Administrator"    { "Full MDE Access" }
+                                "Security Administrator"  { "Full MDE Read/Write" }
+                                "Security Operator"       { "MDE Response Actions" }
+                                "Security Reader"         { "MDE Read Only" }
+                                "Global Reader"           { "MDE Read Only" }
+                                "Helpdesk Administrator"  { "MDE Device Management" }
+                                "Intune Administrator"    { "MDE Device Management" }
+                                default                   { "-" }
+                            }
+                            PurviewAccessLevel = switch ($role.DisplayName) {
+                                "Global Administrator"                { "Full Purview Access" }
+                                "Compliance Administrator"            { "Full Compliance Center" }
+                                "Compliance Data Administrator"       { "Read/Write Compliance Data" }
+                                "Security Administrator"              { "Read Purview Alerts" }
+                                "Security Reader"                     { "Read Only" }
+                                "Global Reader"                       { "Read Only" }
+                                "Information Protection Administrator" { "Sensitivity Labels & DLP" }
+                                default                               { "-" }
+                            }
                             ExportedAt        = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
                         }
                     }
@@ -267,7 +332,7 @@ try {
         }
     }
 
-    Export-Results -Data $entraRoleAssignments -FileName "1_EntraID_Roles" -Format $ExportFormat
+    Export-Results -Data $entraRoleAssignments -FileName "1_Entra_Security_Roles" -Format $ExportFormat
 }
 catch {
     Write-Error "Failed to retrieve Entra ID roles: $_"
@@ -720,26 +785,7 @@ if ($IncludePurview) {
                 }
             }
 
-            # 5_Purview_RoleGroups.csv        -- one row per member
             Export-Results -Data $purviewMembers -FileName "5_Purview_RoleGroups" -Format $ExportFormat
-
-            # 5_Purview_RoleGroups_Summary.csv -- one row per role group with member UPN list
-            $purviewSummary = $purviewMembers |
-                Group-Object RoleGroupName |
-                ForEach-Object {
-                    $realMembers = $_.Group | Where-Object { -not [string]::IsNullOrWhiteSpace($_.MemberUPN) }
-                    [PSCustomObject]@{
-                        RoleGroupName   = $_.Name
-                        MemberCount     = $realMembers.Count
-                        Members         = ($realMembers | Select-Object -ExpandProperty MemberUPN) -join "; "
-                        AssignedRoles   = $_.Group[0].AssignedRoles
-                        Description     = $_.Group[0].RoleGroupDescription
-                    }
-                } |
-                Sort-Object MemberCount -Descending
-
-            Export-Results -Data $purviewSummary -FileName "5_Purview_RoleGroups_Summary" -Format $ExportFormat
-
             Write-OK "Total Purview role group member entries: $($purviewMembers.Count)"
 
             Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
@@ -754,6 +800,7 @@ if ($IncludePurview) {
 else {
     Write-Warn "Purview export skipped. Use -IncludePurview -PurviewAdminUPN 'admin@tenant.com' to enable."
 }
+
 
 # =============================================================================
 # SECTION 6: Microsoft Defender XDR - Complete RBAC
@@ -797,7 +844,7 @@ if ($IncludeXDRRBAC) {
 
     # Two tokens required:
     #   wdatpToken : api.securitycenter.microsoft.com  (sections 6a-6d)
-    #   secToken   : api.security.microsoft.com        (section 6f Advanced Hunting)
+    #   secToken   : api.security.microsoft.com        (section 6d Advanced Hunting)
     $Script:wdatpToken = $null
     $Script:secToken   = $null
 
@@ -830,7 +877,7 @@ if ($IncludeXDRRBAC) {
 
         Write-Step "  Acquiring XDR Security token (api.security.microsoft.com)..."
         $Script:secToken = Get-MdeToken -Scope "https://api.security.microsoft.com/.default"
-        if ($Script:secToken) { Write-OK "  XDR Security token acquired" } else { Write-Warn "  XDR Security token failed -- section 6f Advanced Hunting will be skipped." }
+        if ($Script:secToken) { Write-OK "  XDR Security token acquired" } else { Write-Warn "  XDR Security token failed -- section 6d Advanced Hunting will be skipped." }
     }
 
     function Invoke-MdeApi {
@@ -846,294 +893,64 @@ if ($IncludeXDRRBAC) {
                 $all += $vals
                 $next = $r.'@odata.nextLink'
             }
-            catch { Write-Warn "    MDE API call failed ($next): $_"; break }
+            catch {
+                $msg = $_.ToString()
+                if ($msg -like "*404*") {
+                    # 404 on /api/roles is expected for Unified RBAC tenants -- not a real failure
+                } else {
+                    Write-Warn "    MDE API call failed ($next): $_"
+                }
+                break
+            }
         } while ($next)
         return $all
     }
 
     # -------------------------------------------------------------------------
-    # 6a - MDE Custom Roles
+    # [COMMENTED OUT] MDE UnifiedRoles -- legacy MDE custom roles (pre-Feb 2025 tenants only)
+    # Uncomment if your tenant has legacy MDE RBAC enabled
     # -------------------------------------------------------------------------
-    Write-Step "6a - MDE: Fetching custom roles (Settings > Endpoints > Roles)..."
-
-    $mdeRoles    = @()
+    <#
+    Write-Step "MDE UnifiedRoles: Fetching custom roles (Settings > Endpoints > Roles)..."
+    $mdeRolesRaw = Invoke-MdeApi -Uri "https://api.security.microsoft.com/api/roles" -Token $Script:wdatpToken
+    if ($mdeRolesRaw.Count -gt 0) {
+        $mdeUnifiedRoles = $mdeRolesRaw | ForEach-Object {
+            [PSCustomObject]@{
+                RoleId          = $_.id
+                RoleDisplayName = $_.name
+                RoleDescription = $_.description
+                IsEnabled       = $_.enabled
+                Permissions     = ($_.permissions -join "; ")
+                AssignedGroups  = ($_.roleGroups | ForEach-Object { $_.name }) -join "; "
+                ExportedAt      = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+            }
+        }
+        Export-Results -Data $mdeUnifiedRoles -FileName "6_MDE_UnifiedRoles" -Format $ExportFormat
+        Write-OK "  UnifiedRoles - Found $($mdeUnifiedRoles.Count) role(s)"
+    }
+    #>
     $mdeRolesRaw = @()
 
-    if (-not $Script:wdatpToken) {
-        Write-Warn "  6a - Skipped: no WDATP token."
-    }
-    else {
-        $mdeRolesRaw = Invoke-MdeApi -Uri "https://api.security.microsoft.com/api/roles" -Token $Script:wdatpToken
-
-        if ($mdeRolesRaw.Count -eq 0) {
-            Write-Warn "  6a - No MDE custom roles returned. Expected for tenants using XDR Unified RBAC (post Feb 2025)."
-        }
-        else {
-            foreach ($role in $mdeRolesRaw) {
-                $mdeRoles += [PSCustomObject]@{
-                    RoleId          = $role.id
-                    RoleDisplayName = $role.name
-                    RoleDescription = $role.description
-                    IsEnabled       = $role.enabled
-                    Permissions     = ($role.permissions -join "; ")
-                    AssignedGroups  = ($role.roleGroups | ForEach-Object { $_.name }) -join "; "
-                    ExportedAt      = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-                }
-            }
-            Write-OK "  6a - Found $($mdeRoles.Count) MDE custom role(s)"
-        }
-    }
-
-    Export-Results -Data $mdeRoles -FileName "6a_MDE_CustomRoles" -Format $ExportFormat
 
     # -------------------------------------------------------------------------
-    # 6b - MDE Role Assignments
-    # -------------------------------------------------------------------------
-    Write-Step "6b - MDE: Fetching role assignments..."
-
-    $mdeRoleAssignments = @()
-
-    if (-not $Script:wdatpToken) {
-        Write-Warn "  6b - Skipped: no WDATP token."
-    }
-    else {
-        try {
-            if ($mdeRolesRaw.Count -eq 0) {
-                Write-Warn "  6b - No roles from 6a to expand."
-            }
-            else {
-                foreach ($role in $mdeRolesRaw) {
-                    $roleName = $role.name
-
-                    if (-not $role.roleGroups -or $role.roleGroups.Count -eq 0) {
-                        $mdeRoleAssignments += [PSCustomObject]@{
-                            AssignmentId    = ""
-                            RoleId          = $role.id
-                            RoleDisplayName = $roleName
-                            AssignedToType  = "(No groups assigned)"
-                            AssignedToName  = ""
-                            AssignedToUPN   = ""
-                            AssignedToMail  = ""
-                            Department      = ""
-                            JobTitle        = ""
-                            AccountEnabled  = ""
-                            PrincipalId     = ""
-                            DeviceGroupIds  = ""
-                            ExportedAt      = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-                        }
-                        continue
-                    }
-
-                    foreach ($rg in $role.roleGroups) {
-                        $groupId   = $rg.id
-                        $groupName = $rg.name
-
-                        $mdeRoleAssignments += [PSCustomObject]@{
-                            AssignmentId    = $role.id
-                            RoleId          = $role.id
-                            RoleDisplayName = $roleName
-                            AssignedToType  = "Group"
-                            AssignedToName  = $groupName
-                            AssignedToUPN   = ""
-                            AssignedToMail  = ""
-                            Department      = ""
-                            JobTitle        = ""
-                            AccountEnabled  = ""
-                            PrincipalId     = $groupId
-                            DeviceGroupIds  = ""
-                            ExportedAt      = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-                        }
-
-                        $groupMembers = Resolve-GroupMembersForMDE -GroupId $groupId -GroupName $groupName
-                        foreach ($gm in $groupMembers) {
-                            $mdeRoleAssignments += [PSCustomObject]@{
-                                AssignmentId    = $role.id
-                                RoleId          = $role.id
-                                RoleDisplayName = $roleName
-                                AssignedToType  = $gm.MemberType
-                                AssignedToName  = $gm.MemberDisplayName
-                                AssignedToUPN   = $gm.MemberUPN
-                                AssignedToMail  = $gm.MemberMail
-                                Department      = $gm.Department
-                                JobTitle        = $gm.JobTitle
-                                AccountEnabled  = $gm.AccountEnabled
-                                PrincipalId     = $gm.MemberId
-                                DeviceGroupIds  = ""
-                                ExportedAt      = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-                            }
-                        }
-                    }
-                }
-                Write-OK "  6b - $($mdeRoleAssignments.Count) MDE role assignment entries (incl. group expansion)"
-            }
-        }
-        catch {
-            Write-Warn "  6b - Failed to build role assignments: $_"
-        }
-    }
-
-    Export-Results -Data $mdeRoleAssignments -FileName "6b_MDE_RoleAssignments" -Format $ExportFormat
-
-    # -------------------------------------------------------------------------
-    # 6c - MDE Device Groups
-    # -------------------------------------------------------------------------
-    Write-Step "6c - MDE: Fetching device groups..."
-
-    $mdeDeviceGroups    = @()
-    $mdeDeviceGroupsRaw = @()
-
-    if (-not $Script:wdatpToken) {
-        Write-Warn "  6c - Skipped: no WDATP token."
-        $mdeDeviceGroups += [PSCustomObject]@{
-            DeviceGroupId   = "NO_TOKEN"; DeviceGroupName = "Provide -AppClientId / -AppClientSecret to retrieve device groups"
-            Description     = ""; IsUnassigned = ""; Rank = ""; RemediationLevel = ""; MachineCount = ""
-            ExportedAt      = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-        }
-    }
-    else {
-        $mdeDeviceGroupsRaw = Invoke-MdeApi -Uri "https://api.security.microsoft.com/api/machinegroups" -Token $Script:wdatpToken
-
-        if ($mdeDeviceGroupsRaw.Count -eq 0) {
-            Write-Warn "  6c - No device groups returned. Verify Machine.Read.All (Application) has Admin Consent."
-        }
-        else {
-            foreach ($dg in $mdeDeviceGroupsRaw) {
-                $mdeDeviceGroups += [PSCustomObject]@{
-                    DeviceGroupId    = $dg.id
-                    DeviceGroupName  = $dg.name
-                    Description      = $dg.description
-                    IsUnassigned     = $dg.isUnassigned
-                    Rank             = $dg.rank
-                    RemediationLevel = $dg.remediationLevel
-                    MachineCount     = $dg.machineCount
-                    ExportedAt       = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-                }
-            }
-            Write-OK "  6c - Found $($mdeDeviceGroups.Count) device group(s)"
-        }
-    }
-
-    Export-Results -Data $mdeDeviceGroups -FileName "6c_MDE_DeviceGroups" -Format $ExportFormat
-
-    # -------------------------------------------------------------------------
-    # 6d - MDE Role-to-DeviceGroup Access Matrix
-    # -------------------------------------------------------------------------
-    Write-Step "6d - MDE: Building Role-to-DeviceGroup access matrix..."
-
-    $mdeAccessMatrix = @()
-
-    if ($mdeRoleAssignments.Count -gt 0) {
-
-        $uniqueAssignments = $mdeRoleAssignments |
-            Select-Object AssignmentId, RoleDisplayName, AssignedToName, AssignedToUPN,
-                          AssignedToType, Department, AccountEnabled, DeviceGroupIds |
-            Sort-Object RoleDisplayName, AssignedToUPN -Unique
-
-        foreach ($ua in $uniqueAssignments) {
-
-            if ([string]::IsNullOrWhiteSpace($ua.DeviceGroupIds)) {
-                $deviceGroupScope = "ALL DEVICE GROUPS (unrestricted)"
-                $deviceGroupNames = "ALL DEVICE GROUPS"
-            }
-            else {
-                $dgIds   = $ua.DeviceGroupIds -split ";" | ForEach-Object { $_.Trim() }
-                $dgNames = foreach ($dgId in $dgIds) {
-                    $matchedDG = $mdeDeviceGroupsRaw | Where-Object { $_.id -eq $dgId }
-                    if ($matchedDG) { $matchedDG.name } else { "ID:$dgId" }
-                }
-                $deviceGroupScope = $dgIds -join "; "
-                $deviceGroupNames = $dgNames -join "; "
-            }
-
-            $mdeAccessMatrix += [PSCustomObject]@{
-                RoleDisplayName  = $ua.RoleDisplayName
-                AssignedToName   = $ua.AssignedToName
-                AssignedToUPN    = $ua.AssignedToUPN
-                AssignedToType   = $ua.AssignedToType
-                Department       = $ua.Department
-                AccountEnabled   = $ua.AccountEnabled
-                DeviceGroupScope = $deviceGroupScope
-                DeviceGroupNames = $deviceGroupNames
-                AccessLevel      = if ($deviceGroupNames -like "*ALL*") { "FULL TENANT ACCESS" } else { "SCOPED ACCESS" }
-                ExportedAt       = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-            }
-        }
-
-        Write-OK "Access matrix built: $($mdeAccessMatrix.Count) role-to-device-group mappings"
-    }
-    else {
-        Write-Warn "  No MDE role assignments available to build access matrix."
-    }
-
-    Export-Results -Data $mdeAccessMatrix -FileName "6d_MDE_AccessMatrix" -Format $ExportFormat
-
-    # -------------------------------------------------------------------------
-    # 6e - Entra ID Roles with MDE/XDR Portal Access
-    # -------------------------------------------------------------------------
-    Write-Step "6e - MDI/XDR: Filtering Entra ID roles with XDR product access..."
-
-    $mdeRelevantEntraRoles = @(
-        "Global Administrator",
-        "Security Administrator",
-        "Security Reader",
-        "Security Operator",
-        "Compliance Administrator",
-        "Global Reader",
-        "Helpdesk Administrator",
-        "Intune Administrator"
-    )
-
-    $mdeEntraAccess = @()
-
-    if ($entraRoleAssignments.Count -gt 0) {
-        $mdeEntraAccess = $entraRoleAssignments |
-            Where-Object { $_.RoleName -in $mdeRelevantEntraRoles } |
-            Select-Object `
-                RoleName, MemberType, MemberDisplayName, MemberUPN, MemberMail,
-                MemberDepartment, MemberJobTitle, AccountEnabled, UserType, AssignmentType,
-                @{ Name="MDEAccessLevel"; Expression={
-                    switch ($_.RoleName) {
-                        "Global Administrator"    { "Full MDE Access (all features, all settings)" }
-                        "Security Administrator"  { "Full MDE Read/Write (alerts, investigations, settings)" }
-                        "Security Operator"       { "MDE Response Actions (isolate, run AV scan, no settings change)" }
-                        "Security Reader"         { "MDE Read Only (view alerts, investigations, reports)" }
-                        "Global Reader"           { "MDE Read Only (view only, no actions)" }
-                        "Compliance Administrator"{ "MDE Read (limited -- compliance-related data only)" }
-                        "Helpdesk Administrator"  { "MDE Device Management (onboard/offboard, device actions)" }
-                        "Intune Administrator"    { "MDE Device Management (Intune-integrated device actions)" }
-                        default                   { "Unknown" }
-                    }
-                }},
-                ExportedAt
-
-        Write-OK "Found $($mdeEntraAccess.Count) Entra ID role assignments with MDE access"
-    }
-    else {
-        Write-Warn "  Entra ID role data not available (Section 1 may have been skipped or empty)."
-    }
-
-    Export-Results -Data $mdeEntraAccess -FileName "6e_XDR_EntraRoles_Access" -Format $ExportFormat
-
-    # -------------------------------------------------------------------------
-    # 6f - MDE RBAC Identity Audit via Advanced Hunting (KQL)
+    # 6b - MDE_RBAC / 6c - Identity Audit via Advanced Hunting (KQL)
     # Queries IdentityInfo for identities with Entra roles or group memberships.
     # Cross-references Section 1 to flag blind spots.
     # -------------------------------------------------------------------------
-    Write-Step "6f - MDE Identity Audit via Advanced Hunting (KQL)..."
+    Write-Step "6b/6c - MDE RBAC & Identity Audit via Advanced Hunting (KQL)..."
 
-    $mdeIdentityAudit   = @()
-    $mdeAuditBlindSpots = @()
+    $mdeIdentityAudit = @()
 
-    $entraKnownUPNs_6f = @()
+    $entraKnownUPNs_6d = @()
     if ($entraRoleAssignments.Count -gt 0) {
-        $entraKnownUPNs_6f = $entraRoleAssignments |
+        $entraKnownUPNs_6d = $entraRoleAssignments |
             Where-Object { -not [string]::IsNullOrWhiteSpace($_.MemberUPN) } |
             Select-Object -ExpandProperty MemberUPN -Unique
     }
 
     try {
         if (-not $Script:secToken) {
-            Write-Warn "  6f - Skipped: no XDR Security token."
+            Write-Warn "  6d - Skipped: no XDR Security token."
             Write-Warn "  Ensure AdvancedHunting.Read.All (Application) is granted on Microsoft Threat Protection."
         }
         else {
@@ -1157,20 +974,26 @@ IdentityInfo
                     -Headers $hdrs -Body $body -ErrorAction Stop
             }
             catch {
-                Write-Warn "  6f - Advanced Hunting query failed: $_"
+                Write-Warn "  6d - Advanced Hunting query failed: $_"
                 Write-Warn "  Verify AdvancedHunting.Read.All is granted and admin consent applied."
             }
 
             if ($ahResult -and $ahResult.Results -and $ahResult.Results.Count -gt 0) {
-                Write-OK "  6f - Advanced Hunting returned $($ahResult.Results.Count) identity record(s)"
+                Write-OK "  6d - Advanced Hunting returned $($ahResult.Results.Count) identity record(s)"
 
                 foreach ($identity in $ahResult.Results) {
 
                     $rolesStr    = if ($identity.AssignedRoles)   { ($identity.AssignedRoles   | ForEach-Object { $_ }) -join "; " } else { "" }
                     $groupsStr   = if ($identity.GroupMembership) { ($identity.GroupMembership | ForEach-Object { $_ }) -join "; " } else { "" }
-                    $isBlindSpot = ($identity.AccountUpn -notin $entraKnownUPNs_6f) -and (-not [string]::IsNullOrWhiteSpace($identity.AccountUpn))
+                    $isBlindSpot = ($identity.AccountUpn -notin $entraKnownUPNs_6d) -and (-not [string]::IsNullOrWhiteSpace($identity.AccountUpn))
 
-                    $row = [PSCustomObject]@{
+                    # Users have a UPN; apps/service principals do not
+                    $identityType = if (-not [string]::IsNullOrWhiteSpace($identity.AccountUpn)) { "User" }
+                                    elseif ($identity.IdentityEnvironment -eq "Cloud" -and [string]::IsNullOrWhiteSpace($identity.Department)) { "App" }
+                                    else { "ServicePrincipal" }
+
+                    $mdeIdentityAudit += [PSCustomObject]@{
+                        IdentityType         = $identityType
                         AccountUPN           = $identity.AccountUpn
                         DisplayName          = $identity.AccountDisplayName
                         AccountObjectId      = $identity.AccountObjectId
@@ -1186,53 +1009,39 @@ IdentityInfo
                         BlindSpotFlag        = if ($isBlindSpot) { "REVIEW REQUIRED" } else { "" }
                         ExportedAt           = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
                     }
-
-                    $mdeIdentityAudit += $row
-                    if ($isBlindSpot) { $mdeAuditBlindSpots += $row }
                 }
 
-                Write-OK "  6f - Identity audit complete: $($mdeIdentityAudit.Count) identities, $($mdeAuditBlindSpots.Count) blind spot(s)"
-                Write-Host ""
-                Write-Host "  6f Advanced Hunting Identity Audit Results:" -ForegroundColor Cyan
-                Write-Host "  --------------------------------------------" -ForegroundColor Cyan
-                Write-Host "  Identities with roles or group memberships : $($mdeIdentityAudit.Count)" -ForegroundColor White
-                Write-Host "  Not present in Section 1 Entra role export : $($mdeAuditBlindSpots.Count)" -ForegroundColor $(if ($mdeAuditBlindSpots.Count -gt 0) { "Red" } else { "Green" })
-                Write-Host ""
+                $blindSpotCount = ($mdeIdentityAudit | Where-Object { $_.BlindSpotFlag -eq "REVIEW REQUIRED" }).Count
+                Write-OK "  6b - Identity audit complete: $($mdeIdentityAudit.Count) identities, $blindSpotCount blind spot(s)"
 
-                if ($mdeAuditBlindSpots.Count -gt 0) {
-                    Write-Warn "  ACTION REQUIRED: $($mdeAuditBlindSpots.Count) identities have Entra roles or group memberships"
-                    Write-Warn "  but do not appear in Section 1. Review '6f_MDE_BlindSpots'."
+                $blindSpots = ($mdeIdentityAudit | Where-Object { $_.BlindSpotFlag -eq "REVIEW REQUIRED" }).Count
+                if ($blindSpots -gt 0) {
+                    Write-Warn "  ACTION REQUIRED: $blindSpots identities not in Section 1 -- filter BlindSpotFlag=REVIEW REQUIRED in 6b_MDE_RBAC."
                 }
                 else {
                     Write-OK "  No blind spots detected -- all identities with roles/groups are covered in Section 1."
                 }
             }
             else {
-                Write-Warn "  6f - No results from Advanced Hunting. Verify Defender for Identity or Entra ID connector is active."
+                Write-Warn "  6d - No results from Advanced Hunting. Verify Defender for Identity or Entra ID connector is active."
             }
         }
     }
     catch {
-        Write-Warn "  6f - Advanced Hunting section failed: $_"
+        Write-Warn "  6d - Advanced Hunting section failed: $_"
     }
 
-    Export-Results -Data $mdeIdentityAudit  -FileName "6f_MDE_IdentityAudit" -Format $ExportFormat
-    Export-Results -Data $mdeAuditBlindSpots -FileName "6f_MDE_BlindSpots"    -Format $ExportFormat
+    Export-Results -Data $mdeIdentityAudit -FileName "6b_MDE_RBAC" -Format $ExportFormat
 
     Write-Host ""
     Write-Host "  XDR Complete RBAC Export Summary" -ForegroundColor Cyan
     Write-Host "  --------------------------------" -ForegroundColor Cyan
-    Write-Host "  6a  MDE Custom Roles              : $($mdeRoles.Count) roles" -ForegroundColor White
-    Write-Host "  6b  MDE Role Assignments           : $($mdeRoleAssignments.Count) entries" -ForegroundColor White
-    Write-Host "  6c  MDE Device Groups              : $($mdeDeviceGroups.Count) groups" -ForegroundColor White
-    Write-Host "  6d  Role-to-DeviceGroup Matrix     : $($mdeAccessMatrix.Count) mappings" -ForegroundColor White
-    Write-Host "  6e  Entra Roles with MDE Access    : $($mdeEntraAccess.Count) assignments" -ForegroundColor White
-    Write-Host "  6f  Advanced Hunting Identity Audit: $($mdeIdentityAudit.Count) identities | $($mdeAuditBlindSpots.Count) blind spot(s)" -ForegroundColor $(if ($mdeAuditBlindSpots.Count -gt 0) { "Red" } else { "White" })
+    Write-Host "  6b  MDE RBAC : $($mdeIdentityAudit.Count) identities (filter BlindSpotFlag=REVIEW REQUIRED for gaps)" -ForegroundColor White
     Write-Host ""
 
     if ($mdeRoles.Count -eq 0 -and $mdeRoleAssignments.Count -eq 0) {
         Write-Warn "  Sections 6a/6b returned 0 roles -- expected for XDR Unified RBAC tenants (post Feb 2025)."
-        Write-Warn "  MDE access is controlled via Entra ID roles (see 6e) and group memberships (see 6f)."
+        Write-Warn "  MDE access is controlled via Entra ID roles (see 6c) and group memberships (see 6d)."
     }
 }
 else {
@@ -1265,11 +1074,7 @@ $manifest = [PSCustomObject]@{
     IncludedPurview         = $IncludePurview.IsPresent
     IncludedXDRRBAC         = $IncludeXDRRBAC.IsPresent
     EntraRoleCount          = $entraRoleAssignments.Count
-    MDECustomRoleCount      = if ($IncludeXDRRBAC) { $mdeRoles.Count }           else { "skipped" }
-    MDEIdentityAuditCount   = if ($IncludeXDRRBAC) { $mdeIdentityAudit.Count }   else { "skipped" }
-    MDEBlindSpotCount       = if ($IncludeXDRRBAC) { $mdeAuditBlindSpots.Count } else { "skipped" }
-    MDEAssignmentCount      = if ($IncludeXDRRBAC) { $mdeRoleAssignments.Count } else { "skipped" }
-    MDEEntraAccessCount     = if ($IncludeXDRRBAC) { $mdeEntraAccess.Count }     else { "skipped" }
+    MDERBACCount            = if ($IncludeXDRRBAC) { $mdeIdentityAudit.Count }   else { "skipped" }
     FilesGenerated          = $files.Count
 }
 
