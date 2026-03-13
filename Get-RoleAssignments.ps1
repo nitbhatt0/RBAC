@@ -1,9 +1,9 @@
-# Get-RoleAssignments.ps1  v1.8
+# Get-RoleAssignments.ps1  v1.9
 # Exports role assignments from: Entra ID, PIM, Sentinel, Defender for Cloud, Purview, Defender XDR
 #
 # Section 6 requires an App Registration with Admin Consent for:
-#   WindowsDefenderATP (Application)          : Machine.Read.All, Machine.ReadWrite.All,
-#                                               SecurityConfiguration.Read.All, AdvancedQuery.Read.All
+#   WindowsDefenderATP (Application)          : Machine.Read.All, SecurityConfiguration.Read.All,
+#                                               AdvancedQuery.Read.All
 #   Microsoft Threat Protection (Application) : AdvancedHunting.Read.All
 #
 # Author : Nitin
@@ -44,7 +44,10 @@ param(
     [string]$AppClientSecret,
 
     [Parameter(HelpMessage = "Tenant ID for the App Registration. Defaults to current Graph tenant.")]
-    [string]$AppTenantId
+    [string]$AppTenantId,
+
+    [Parameter(HelpMessage = "Tenant ID used for Graph and Az account connections.")]
+    [string]$TenantId = ""
 )
 
 # =============================================================================
@@ -91,7 +94,7 @@ function Export-Results {
 # Setup
 # =============================================================================
 
-Write-Header "Microsoft Security Stack - Role Assignments Export v1.8"
+Write-Header "Microsoft Security Stack - Role Assignments Export v2.0"
 
 if (-not (Test-Path $OutputPath)) {
     New-Item -ItemType Directory -Path $OutputPath | Out-Null
@@ -147,15 +150,65 @@ Write-Header "1/6  Entra ID - Directory Role Assignments"
 Write-Step "Connecting to Microsoft Graph..."
 
 try {
-    Connect-MgGraph -Scopes "RoleManagement.Read.All",
-                             "Directory.Read.All",
-                             "User.Read.All",
-                             "Group.Read.All" -ErrorAction Stop
-    Write-OK "Connected to Microsoft Graph"
+    $mgCtx = Get-MgContext
+
+    if (-not $mgCtx) {
+        $connectParams = @{
+            Scopes                  = "RoleManagement.Read.All","Directory.Read.All","User.Read.All","Group.Read.All"
+            UseDeviceAuthentication = $true
+            NoWelcome               = $true
+            ErrorAction             = "Stop"
+        }
+        if ($TenantId) { $connectParams["TenantId"] = $TenantId }
+        Connect-MgGraph @connectParams
+        $mgCtx = Get-MgContext
+        Write-OK "Connected to Microsoft Graph (device auth)"
+    }
+    else {
+        Write-OK "Reusing existing Graph session ($($mgCtx.Account))"
+    }
+
+    # Always resolve TenantId from live session - overrides any hardcoded default
+    $TenantId = $mgCtx.TenantId
+    Write-OK "Resolved TenantId from Graph session: $TenantId"
 }
 catch {
     Write-Error "Graph connection failed: $_"
     exit 1
+}
+
+# =============================================================================
+# Az Account Connection (Sections 3 + 4)
+# =============================================================================
+
+if ($SentinelWorkspaces.Count -gt 0 -or $ScanDefenderForCloud) {
+    Write-Step "Connecting to Azure (required for Sentinel / Defender for Cloud)..."
+    try {
+        # Validate existing session with a lightweight test call
+        $azCtx      = Get-AzContext
+        $tokenValid = $false
+
+        if ($azCtx -and $azCtx.Tenant.Id -eq $TenantId) {
+            try {
+                Get-AzSubscription -TenantId $TenantId -ErrorAction Stop | Out-Null
+                $tokenValid = $true
+                Write-OK "Existing Az session token validated ($($azCtx.Account.Id))"
+            }
+            catch {
+                Write-Warn "Existing Az session token is stale -- reconnecting..."
+            }
+        }
+
+        if (-not $tokenValid) {
+            if ($azCtx) { Disconnect-AzAccount -Confirm:$false -ErrorAction SilentlyContinue | Out-Null }
+            Connect-AzAccount -TenantId $TenantId -UseDeviceAuthentication -ErrorAction Stop | Out-Null
+            Write-OK "Connected to Azure: $((Get-AzContext).Account.Id)"
+        }
+    }
+    catch {
+        Write-Error "Az connection failed: $_"
+        exit 1
+    }
 }
 
 Write-Step "Fetching active directory role assignments..."
@@ -362,17 +415,54 @@ if ($IncludePIM) {
 
             if ($roleDef.DisplayName -notin $targetEntraRoles) { continue }
 
+            # Resolve principal: try User first, then Group, then ServicePrincipal
+            $memberDisplayName = $principalId
+            $memberUPN         = ""
+            $memberMail        = ""
+            $memberDepartment  = ""
+            $memberType        = "Unknown"
+
             $user = Get-MgUser -UserId $principalId `
                         -Property "DisplayName,UserPrincipalName,Mail,Department" `
                         -ErrorAction SilentlyContinue
 
+            if ($user) {
+                $memberDisplayName = $user.DisplayName
+                $memberUPN         = $user.UserPrincipalName
+                $memberMail        = $user.Mail
+                $memberDepartment  = $user.Department
+                $memberType        = "User"
+            }
+            else {
+                $group = Get-MgGroup -GroupId $principalId `
+                             -Property "DisplayName,Mail" `
+                             -ErrorAction SilentlyContinue
+
+                if ($group) {
+                    $memberDisplayName = $group.DisplayName
+                    $memberMail        = $group.Mail
+                    $memberType        = "Group"
+                }
+                else {
+                    $sp = Get-MgServicePrincipal -ServicePrincipalId $principalId `
+                              -Property "DisplayName" `
+                              -ErrorAction SilentlyContinue
+
+                    if ($sp) {
+                        $memberDisplayName = $sp.DisplayName
+                        $memberType        = "ServicePrincipal"
+                    }
+                }
+            }
+
             $pimAssignments += [PSCustomObject]@{
                 RoleName          = $roleDef.DisplayName
                 RoleId            = $roleDefId
-                MemberDisplayName = if ($user) { $user.DisplayName } else { $principalId }
-                MemberUPN         = $user.UserPrincipalName
-                MemberMail        = $user.Mail
-                MemberDepartment  = $user.Department
+                MemberType        = $memberType
+                MemberDisplayName = $memberDisplayName
+                MemberUPN         = $memberUPN
+                MemberMail        = $memberMail
+                MemberDepartment  = $memberDepartment
                 AssignmentType    = "PIM-Eligible"
                 ScheduleStartDate = $assignment.ScheduleInfo.StartDateTime
                 ScheduleExpiry    = $assignment.ScheduleInfo.Expiration.EndDateTime
@@ -430,7 +520,7 @@ if ($SentinelWorkspaces.Count -gt 0) {
         Write-Step "  Workspace $wsIndex/$($SentinelWorkspaces.Count): $wsId (RG: $wsRG, Sub: $wsSubId)"
 
         try {
-            Set-AzContext -SubscriptionId $wsSubId -ErrorAction Stop | Out-Null
+            Set-AzContext -SubscriptionId $wsSubId -Tenant $TenantId -ErrorAction Stop | Out-Null
 
             $sentinelScope = "/subscriptions/$wsSubId/resourceGroups/$wsRG"
 
@@ -528,7 +618,7 @@ if ($SentinelWorkspaces.Count -gt 0) {
         Write-Step "  3b scanning workspace: $wsId"
 
         try {
-            Set-AzContext -SubscriptionId $wsSubId -ErrorAction Stop | Out-Null
+            Set-AzContext -SubscriptionId $wsSubId -Tenant $TenantId -ErrorAction Stop | Out-Null
 
             $sentinelScope         = "/subscriptions/$wsSubId/resourceGroups/$wsRG"
             $allAssignmentsAtScope = Get-AzRoleAssignment -Scope $sentinelScope -ErrorAction Stop
@@ -633,7 +723,7 @@ if ($ScanDefenderForCloud) {
             Write-Step "  Checking [$($sub.Name)] ($($sub.Id))..."
 
             try {
-                Set-AzContext -SubscriptionId $sub.Id -ErrorAction Stop | Out-Null
+                Set-AzContext -SubscriptionId $sub.Id -Tenant $TenantId -ErrorAction Stop | Out-Null
 
                 $pricingTiers = Get-AzSecurityPricing -ErrorAction SilentlyContinue
                 $enabledPlans = $pricingTiers |
