@@ -857,15 +857,97 @@ if ($IncludePurview) {
                     }
                     else {
                         foreach ($m in $members) {
-                            $purviewMembers += [PSCustomObject]@{
-                                RoleGroupName        = $rg.Name
-                                RoleGroupDescription = $rg.Description
-                                RoleGroupType        = $rg.RoleGroupType
-                                AssignedRoles        = $roleList
-                                MemberDisplayName    = $m.DisplayName
-                                MemberUPN            = if (-not [string]::IsNullOrWhiteSpace($m.WindowsLiveId)) { $m.WindowsLiveId } elseif (-not [string]::IsNullOrWhiteSpace($m.PrimarySmtpAddress)) { $m.PrimarySmtpAddress } else { $m.Name }
-                                MemberType           = $m.RecipientTypeDetails
-                                ExportedAt           = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                            $recipientType = $m.RecipientTypeDetails
+
+                            $isGroup = $recipientType -match "Group|MailUniversalDistributionGroup|MailNonUniversalGroup|MailUniversalSecurityGroup|GroupMailbox"
+
+                            if ($isGroup) {
+                                Write-Step "    Expanding group: $($m.DisplayName)"
+
+                                # Exchange objects rarely populate ExternalDirectoryObjectId.
+                                # Resolve the group in Graph using DisplayName or PrimarySmtpAddress.
+                                $mgGroup = $null
+                                try {
+                                    if (-not [string]::IsNullOrWhiteSpace($m.ExternalDirectoryObjectId)) {
+                                        $mgGroup = Get-MgGroup -GroupId $m.ExternalDirectoryObjectId -ErrorAction SilentlyContinue
+                                    }
+                                    if (-not $mgGroup -and -not [string]::IsNullOrWhiteSpace($m.PrimarySmtpAddress)) {
+                                        $mgGroup = Get-MgGroup -Filter "mail eq '$($m.PrimarySmtpAddress)'" -ErrorAction SilentlyContinue | Select-Object -First 1
+                                    }
+                                    if (-not $mgGroup) {
+                                        $mgGroup = Get-MgGroup -Filter "displayName eq '$($m.DisplayName)'" -ErrorAction SilentlyContinue | Select-Object -First 1
+                                    }
+                                }
+                                catch { $mgGroup = $null }
+
+                                if ($mgGroup) {
+                                    try {
+                                        $groupUsers = Get-MgGroupMember -GroupId $mgGroup.Id -All -ErrorAction SilentlyContinue
+                                        $expanded = 0
+                                        foreach ($gu in $groupUsers) {
+                                            $odataType = $gu.AdditionalProperties["@odata.type"] -replace "#microsoft.graph.", ""
+                                            if ($odataType -eq "user") {
+                                                $u = Get-MgUser -UserId $gu.Id `
+                                                        -Property "DisplayName,UserPrincipalName,Mail,AccountEnabled,Department,JobTitle" `
+                                                        -ErrorAction SilentlyContinue
+                                                $purviewMembers += [PSCustomObject]@{
+                                                    RoleGroupName        = $rg.Name
+                                                    RoleGroupDescription = $rg.Description
+                                                    RoleGroupType        = $rg.RoleGroupType
+                                                    AssignedRoles        = $roleList
+                                                    MemberDisplayName    = $u.DisplayName
+                                                    MemberUPN            = $u.UserPrincipalName
+                                                    MemberMail           = $u.Mail
+                                                    MemberType           = "User (via Group: $($m.DisplayName))"
+                                                    AccountEnabled       = $u.AccountEnabled
+                                                    Department           = $u.Department
+                                                    JobTitle             = $u.JobTitle
+                                                    ExportedAt           = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                                                }
+                                                $expanded++
+                                            }
+                                        }
+                                        Write-OK "    Expanded '$($m.DisplayName)': $expanded user(s)"
+                                    }
+                                    catch {
+                                        Write-Warn "    Could not expand group '$($m.DisplayName)': $_"
+                                    }
+                                }
+                                else {
+                                    # Graph lookup failed -- record group as-is
+                                    Write-Warn "    Could not resolve group '$($m.DisplayName)' in Graph -- recording as group"
+                                    $purviewMembers += [PSCustomObject]@{
+                                        RoleGroupName        = $rg.Name
+                                        RoleGroupDescription = $rg.Description
+                                        RoleGroupType        = $rg.RoleGroupType
+                                        AssignedRoles        = $roleList
+                                        MemberDisplayName    = $m.DisplayName
+                                        MemberUPN            = if (-not [string]::IsNullOrWhiteSpace($m.PrimarySmtpAddress)) { $m.PrimarySmtpAddress } else { $m.Name }
+                                        MemberMail           = $m.PrimarySmtpAddress
+                                        MemberType           = "$recipientType (Group - could not expand)"
+                                        AccountEnabled       = ""
+                                        Department           = ""
+                                        JobTitle             = ""
+                                        ExportedAt           = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                                    }
+                                }
+                            }
+                            else {
+                                # Direct user member
+                                $purviewMembers += [PSCustomObject]@{
+                                    RoleGroupName        = $rg.Name
+                                    RoleGroupDescription = $rg.Description
+                                    RoleGroupType        = $rg.RoleGroupType
+                                    AssignedRoles        = $roleList
+                                    MemberDisplayName    = $m.DisplayName
+                                    MemberUPN            = if (-not [string]::IsNullOrWhiteSpace($m.WindowsLiveId)) { $m.WindowsLiveId } elseif (-not [string]::IsNullOrWhiteSpace($m.PrimarySmtpAddress)) { $m.PrimarySmtpAddress } else { $m.Name }
+                                    MemberMail           = $m.PrimarySmtpAddress
+                                    MemberType           = $recipientType
+                                    AccountEnabled       = ""
+                                    Department           = ""
+                                    JobTitle             = ""
+                                    ExportedAt           = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                                }
                             }
                         }
                     }
