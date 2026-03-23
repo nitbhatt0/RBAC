@@ -3,8 +3,6 @@
 
 Section-wise permissions required (for the user running the script)
 
-Here's the section-wise permissions in that format:
-
 Section 1 — Entra ID Directory Roles (always runs)
 Entra role → Global Reader or Security Reader
 Graph scope → RoleManagement.Read.All
