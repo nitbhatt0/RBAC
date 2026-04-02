@@ -1,52 +1,23 @@
-# Get-RoleAssignments.ps1  v1.9
+# Get-RoleAssignments.ps1  v2.0
 # Exports role assignments from: Entra ID, PIM, Sentinel, Defender for Cloud, Purview, Defender XDR
-<#
-Section-wise permissions required (for the user running the script)
+#
+# App Registration required (used for ALL sections - Graph + Section 6 API calls):
+#   Sections 1-5 (Microsoft Graph - Application permissions, Admin Consent required):
+#     Microsoft Graph (Application) : RoleManagement.Read.All
+#     Microsoft Graph (Application) : Directory.Read.All
+#     Microsoft Graph (Application) : User.Read.All
+#     Microsoft Graph (Application) : Group.Read.All
+#     Microsoft Graph (Application) : Application.Read.All
+#
+#   Section 6 (Defender APIs - Application permissions, Admin Consent required):
+#     WindowsDefenderATP (Application)          : Machine.Read.All
+#     WindowsDefenderATP (Application)          : SecurityConfiguration.Read.All
+#     WindowsDefenderATP (Application)          : AdvancedQuery.Read.All
+#     Microsoft Threat Protection (Application) : AdvancedHunting.Read.All
+#
+# Author : Nitin
 
-Section 1 — Entra ID Directory Roles (always runs)
-Entra role → Global Reader or Security Reader
-Graph scope → RoleManagement.Read.All
-Graph scope → Directory.Read.All
-Graph scope → User.Read.All
-Graph scope → Group.Read.All
-Enterprise app → Must be assigned to Microsoft Graph Command Line Tools (if tenant has Assignment Required enabled)
-
-Section 2 — PIM Eligible Assignments (-IncludePIM)
-Entra role → Global Reader or Security Reader
-Graph scope → RoleManagement.Read.All
-Graph scope → Directory.Read.All
-Graph scope → User.Read.All
-Graph scope → Group.Read.All
-Graph scope → Application.Read.All (required for resolving Service Principal PIM assignments)
-Tenant license → Entra ID P2 required on tenant
-
-Section 3 — Sentinel Workspace RBAC (-SentinelWorkspaces)
-Azure role → Reader on each Sentinel Resource Group
-Azure role → Reader on Subscription (Section 3b custom role inspection)
-Note → Reader at Resource Group scope does not cover subscription-level role definitions — both scopes are needed
-
-Section 4 — Defender for Cloud (-ScanDefenderForCloud)
-Azure role → Security Reader on each Subscription
-Note → Security Reader includes Reader — one role covers both Get-AzSecurityPricing and Get-AzRoleAssignment
-
-Section 5 — Microsoft Purview (-IncludePurview)
-Purview role → View-Only Organization Management (on the -PurviewAdminUPN account)
-Graph scope → Group.Read.All (already granted in Section 1 — reused for group expansion)
-Graph scope → User.Read.All (already granted in Section 1 — reused for expanded member lookup)
-Note → The -PurviewAdminUPN account needs the Purview role — can be a different account from the one running the script
-
-Section 6 — Defender XDR / MDE RBAC (-IncludeXDRRBAC)
-Auth method → App Registration only (-AppClientId, -AppClientSecret) — not the user account
-App permission → WindowsDefenderATP : AdvancedQuery.Read.All (Application + Admin Consent)
-App permission → WindowsDefenderATP : SecurityConfiguration.Read.All (Application + Admin Consent)
-App permission → WindowsDefenderATP : Machine.Read.All (Application + Admin Consent)
-App permission → Microsoft Threat Protection : AdvancedHunting.Read.All (Application + Admin Consent)
-User role → None required — all calls use App Registration tokens
-
-Author : Nitin
-
-Requires -Version 5.1
-#>
+#Requires -Version 5.1
 
 [CmdletBinding()]
 param(
@@ -191,19 +162,31 @@ try {
     $mgCtx = Get-MgContext
 
     if (-not $mgCtx) {
-        $connectParams = @{
-            Scopes                  = "RoleManagement.Read.All","Directory.Read.All","User.Read.All","Group.Read.All","Application.Read.All"
-            UseDeviceAuthentication = $true
-            NoWelcome               = $true
-            ErrorAction             = "Stop"
+        if ([string]::IsNullOrWhiteSpace($AppClientId) -or [string]::IsNullOrWhiteSpace($AppClientSecret)) {
+            Write-Error "AppClientId and AppClientSecret are required for Graph authentication. Provide -AppClientId and -AppClientSecret."
+            exit 1
         }
-        if ($TenantId) { $connectParams["TenantId"] = $TenantId }
-        Connect-MgGraph @connectParams
+        $resolvedTenant = if (-not [string]::IsNullOrWhiteSpace($AppTenantId)) { $AppTenantId } elseif (-not [string]::IsNullOrWhiteSpace($TenantId)) { $TenantId } else { $null }
+        if (-not $resolvedTenant) {
+            Write-Error "TenantId is required for App Registration auth. Provide -TenantId or -AppTenantId."
+            exit 1
+        }
+        # Build Azure.Identity ClientSecretCredential for Connect-MgGraph
+        $clientSecret  = [System.Web.HttpUtility]::UrlEncode($AppClientSecret)
+        $tokenEndpoint = "https://login.microsoftonline.com/$resolvedTenant/oauth2/v2.0/token"
+        $tokenBody = @{
+            grant_type    = "client_credentials"
+            client_id     = $AppClientId
+            client_secret = $AppClientSecret
+            scope         = "https://graph.microsoft.com/.default"
+        }
+        $tokenResponse = Invoke-RestMethod -Method POST -Uri $tokenEndpoint -Body $tokenBody -ErrorAction Stop
+        Connect-MgGraph -AccessToken ($tokenResponse.access_token | ConvertTo-SecureString -AsPlainText -Force) -NoWelcome -ErrorAction Stop
         $mgCtx = Get-MgContext
-        Write-OK "Connected to Microsoft Graph (device auth)"
+        Write-OK "Connected to Microsoft Graph (App Registration: $AppClientId)"
     }
     else {
-        Write-OK "Reusing existing Graph session ($($mgCtx.Account))"
+        Write-OK "Reusing existing Graph session (App: $($mgCtx.ClientId))"
     }
 
     # Always resolve TenantId from live session - overrides any hardcoded default
@@ -239,8 +222,10 @@ if ($SentinelWorkspaces.Count -gt 0 -or $ScanDefenderForCloud) {
 
         if (-not $tokenValid) {
             if ($azCtx) { Disconnect-AzAccount -Confirm:$false -ErrorAction SilentlyContinue | Out-Null }
-            Connect-AzAccount -TenantId $TenantId -UseDeviceAuthentication -ErrorAction Stop | Out-Null
-            Write-OK "Connected to Azure: $((Get-AzContext).Account.Id)"
+            Connect-AzAccount -TenantId $TenantId -ApplicationId $AppClientId -CertificateThumbprint $null `
+                -Credential (New-Object System.Management.Automation.PSCredential($AppClientId, ($AppClientSecret | ConvertTo-SecureString -AsPlainText -Force))) `
+                -ServicePrincipal -ErrorAction Stop | Out-Null
+            Write-OK "Connected to Azure (App Registration: $AppClientId)"
         }
     }
     catch {
@@ -477,9 +462,56 @@ if ($IncludePIM) {
                              -ErrorAction SilentlyContinue
 
                 if ($group) {
-                    $memberDisplayName = $group.DisplayName
-                    $memberMail        = $group.Mail
-                    $memberType        = "Group"
+                    Write-Step "    Expanding PIM group: $($group.DisplayName)"
+                    try {
+                        $groupMembers = Get-MgGroupMember -GroupId $principalId -All -ErrorAction SilentlyContinue
+                        foreach ($gm in $groupMembers) {
+                            $odataType = $gm.AdditionalProperties["@odata.type"] -replace "#microsoft.graph.", ""
+                            if ($odataType -eq "user") {
+                                $u = Get-MgUser -UserId $gm.Id `
+                                        -Property "DisplayName,UserPrincipalName,Mail,Department" `
+                                        -ErrorAction SilentlyContinue
+                                $pimAssignments += [PSCustomObject]@{
+                                    RoleName          = $roleDef.DisplayName
+                                    RoleId            = $roleDefId
+                                    MemberType        = "User (via Group: $($group.DisplayName))"
+                                    MemberDisplayName = $u.DisplayName
+                                    MemberUPN         = $u.UserPrincipalName
+                                    MemberMail        = $u.Mail
+                                    MemberDepartment  = $u.Department
+                                    AssignmentType    = "PIM-Eligible"
+                                    ScheduleStartDate = $assignment.ScheduleInfo.StartDateTime
+                                    ScheduleExpiry    = $assignment.ScheduleInfo.Expiration.EndDateTime
+                                    ExpiryType        = $assignment.ScheduleInfo.Expiration.Type
+                                    MembershipType    = $assignment.MemberType
+                                    Status            = $assignment.Status
+                                    ExportedAt        = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                                }
+                            }
+                        }
+                        Write-OK "    Expanded '$($group.DisplayName)': $($groupMembers.Count) member(s)"
+                    }
+                    catch {
+                        Write-Warn "    Could not expand PIM group '$($group.DisplayName)': $_"
+                        # Fall back to recording the group itself
+                        $pimAssignments += [PSCustomObject]@{
+                            RoleName          = $roleDef.DisplayName
+                            RoleId            = $roleDefId
+                            MemberType        = "Group (could not expand)"
+                            MemberDisplayName = $group.DisplayName
+                            MemberUPN         = $group.Mail
+                            MemberMail        = $group.Mail
+                            MemberDepartment  = ""
+                            AssignmentType    = "PIM-Eligible"
+                            ScheduleStartDate = $assignment.ScheduleInfo.StartDateTime
+                            ScheduleExpiry    = $assignment.ScheduleInfo.Expiration.EndDateTime
+                            ExpiryType        = $assignment.ScheduleInfo.Expiration.Type
+                            MembershipType    = $assignment.MemberType
+                            Status            = $assignment.Status
+                            ExportedAt        = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                        }
+                    }
+                    continue
                 }
                 else {
                     $sp = Get-MgServicePrincipal -ServicePrincipalId $principalId `
