@@ -28,14 +28,25 @@ Permissions required (for the user running the script)
 
 Enterprise app → Must be assigned to Microsoft Graph Command Line Tools (if tenant has Assignment Required enabled)
 
-Section 2 — PIM Eligible Assignments (-IncludePIM)
-Entra role → Global Reader or Security Reader
-Graph scope → RoleManagement.Read.All
-Graph scope → Directory.Read.All
-Graph scope → User.Read.All
-Graph scope → Group.Read.All
-Graph scope → Application.Read.All (required for resolving Service Principal PIM assignments)
-Tenant license → Entra ID P2 required on tenant
+
+========
+## Section 2 — PIM Eligible Assignments (-IncludePIM)
+
+- **Entra role**
+  - Global Reader or Security Reader
+
+- **Graph scopes**
+  - RoleManagement.Read.All
+  - Directory.Read.All
+  - User.Read.All
+  - Group.Read.All
+  - Application.Read.All  
+    *(required for resolving Service Principal PIM assignments)*
+
+- **Tenant license**
+  - Entra ID P2 required on tenant
+
+=========
 
 Section 3 — Sentinel Workspace RBAC (-SentinelWorkspaces)
 Azure role → Reader on each Sentinel Resource Group
