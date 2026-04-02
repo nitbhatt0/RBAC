@@ -2,9 +2,6 @@ Permissions required (for the user running the script)
 
 ## Section 1 — Entra ID Directory Roles (always runs)
 
-- **Entra role**
-  - Global Reader or Security Reader
-
 - **Application permissions**
   - RoleManagement.Read.All → Application
   - Directory.Read.All → Application
@@ -15,10 +12,8 @@ Permissions required (for the user running the script)
 
 ## Section 2 — PIM Eligible Assignments (-IncludePIM)
 
-- **Entra role**
-  - Global Reader or Security Reader
 
-- **Graph scopes**
+- **Application permissions**
   - RoleManagement.Read.All
   - Directory.Read.All
   - User.Read.All
@@ -55,7 +50,7 @@ Permissions required (for the user running the script)
 - **Purview role**
   - View-Only Organization Management *(on the `-PurviewAdminUPN` account)*
 
-- **Graph scopes (reused from Section 1)**
+- **Application permissions** (reused from Section 1)**
   - Group.Read.All *(for group expansion)*
   - User.Read.All *(for expanded member lookup)*
 
