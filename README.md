@@ -5,25 +5,12 @@ Permissions required (for the user running the script)
 - **Entra role**
   - Global Reader or Security Reader
 
-- **Graph scopes**
-  - RoleManagement.Read.All
-  - Directory.Read.All
-  - User.Read.All
-  - Group.Read.All
-
-- **Enterprise app**
-  - Must be assigned to **Microsoft Graph Command Line Tools**
-  - *(if tenant has Assignment Required enabled)*
-
 - **Application permissions**
   - RoleManagement.Read.All → Application
   - Directory.Read.All → Application
   - User.Read.All → Application
   - Group.Read.All → Application
   - Application.Read.All → Application
-
-
-Enterprise app → Must be assigned to Microsoft Graph Command Line Tools (if tenant has Assignment Required enabled)
 
 
 ## Section 2 — PIM Eligible Assignments (-IncludePIM)
@@ -105,4 +92,4 @@ For Sentinel- you can add multiple workspaces. by using
 
 
 For MDC, the Script will scan all subscriptions that have MDC enabled.
-and then will scan/export only these assignments--Owner, Contributor
+and then will scan/export only these assignments--Owner, Contributor, Security Admin
