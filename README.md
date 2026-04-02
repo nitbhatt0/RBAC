@@ -29,7 +29,6 @@ Permissions required (for the user running the script)
 Enterprise app → Must be assigned to Microsoft Graph Command Line Tools (if tenant has Assignment Required enabled)
 
 
-========
 ## Section 2 — PIM Eligible Assignments (-IncludePIM)
 
 - **Entra role**
@@ -46,7 +45,7 @@ Enterprise app → Must be assigned to Microsoft Graph Command Line Tools (if te
 - **Tenant license**
   - Entra ID P2 required on tenant
 
-=========
+
 
 Section 3 — Sentinel Workspace RBAC (-SentinelWorkspaces)
 Azure role → Reader on each Sentinel Resource Group
