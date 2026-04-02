@@ -14,11 +14,11 @@ Permissions required (for the user running the script)
 
 
 - **Application permissions**
-  - RoleManagement.Read.All
-  - Directory.Read.All
-  - User.Read.All
-  - Group.Read.All
-  - Application.Read.All  
+  - RoleManagement.Read.All → Application
+  - Directory.Read.All → Application
+  - User.Read.All → Application
+  - Group.Read.All → Application
+  - Application.Read.All  → Application
     *(required for resolving Service Principal PIM assignments)*
 
 - **Tenant license**
@@ -50,9 +50,9 @@ Permissions required (for the user running the script)
 - **Purview role**
   - View-Only Organization Management *(on the `-PurviewAdminUPN` account)*
 
-- **Application permissions** (reused from Section 1)**
-  - Group.Read.All *(for group expansion)*
-  - User.Read.All *(for expanded member lookup)*
+- **Application permissions (reused from Section 1)**
+  - Group.Read.All *(for group expansion)* → Application
+  - User.Read.All *(for expanded member lookup)* → Application
 
 > ⚠️ **Note:**  
 > The `-PurviewAdminUPN` account needs the Purview role and can be a different account from the one running the script.
