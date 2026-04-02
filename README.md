@@ -3,18 +3,27 @@
 
 Permissions required (for the user running the script)
 
-Section 1 — Entra ID Directory Roles (always runs)
-Entra role → Global Reader or Security Reader
-Graph scope → RoleManagement.Read.All
-Graph scope → Directory.Read.All
-Graph scope → User.Read.All
-Graph scope → Group.Read.All
+## Section 1 — Entra ID Directory Roles (always runs)
 
-RoleManagement.Read.All	→ Application
-Directory.Read.All	→ Application
-User.Read.All	→ Application
-Group.Read.All	→ Application
-Application.Read.All	→ Application
+- **Entra role**
+  - Global Reader or Security Reader
+
+- **Graph scopes**
+  - RoleManagement.Read.All
+  - Directory.Read.All
+  - User.Read.All
+  - Group.Read.All
+
+- **Enterprise app**
+  - Must be assigned to **Microsoft Graph Command Line Tools**
+  - *(if tenant has Assignment Required enabled)*
+
+- **Application permissions**
+  - RoleManagement.Read.All → Application
+  - Directory.Read.All → Application
+  - User.Read.All → Application
+  - Group.Read.All → Application
+  - Application.Read.All → Application
 
 
 Enterprise app → Must be assigned to Microsoft Graph Command Line Tools (if tenant has Assignment Required enabled)
