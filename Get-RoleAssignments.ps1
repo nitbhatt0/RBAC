@@ -222,9 +222,9 @@ if ($SentinelWorkspaces.Count -gt 0 -or $ScanDefenderForCloud) {
 
         if (-not $tokenValid) {
             if ($azCtx) { Disconnect-AzAccount -Confirm:$false -ErrorAction SilentlyContinue | Out-Null }
-            Connect-AzAccount -TenantId $TenantId -ApplicationId $AppClientId -CertificateThumbprint $null `
-                -Credential (New-Object System.Management.Automation.PSCredential($AppClientId, ($AppClientSecret | ConvertTo-SecureString -AsPlainText -Force))) `
-                -ServicePrincipal -ErrorAction Stop | Out-Null
+            $azSecureSecret = ConvertTo-SecureString -String $AppClientSecret -AsPlainText -Force
+            $azCredential   = New-Object System.Management.Automation.PSCredential($AppClientId, $azSecureSecret)
+            Connect-AzAccount -TenantId $TenantId -ServicePrincipal -Credential $azCredential -ErrorAction Stop | Out-Null
             Write-OK "Connected to Azure (App Registration: $AppClientId)"
         }
     }
