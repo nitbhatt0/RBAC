@@ -8,6 +8,7 @@ Permissions required (for the user running the script)
   - User.Read.All → Application
   - Group.Read.All → Application
   - Application.Read.All → Application
+  - PrivilegedAccess.Read.AzureADGroup → Application (for PIM for Groups expansion on role-assigned groups)
 
 
 ## Section 2 — PIM Eligible Assignments (-IncludePIM)
@@ -19,7 +20,7 @@ Permissions required (for the user running the script)
   - User.Read.All → Application
   - Group.Read.All → Application
   - PrivilegedAccess.Read.AzureADGroup → Application
-  - AdvancedHunting.Read.All → Application
+  - AdvancedHunting.Read.All → Application (Section 6b (XDR Advanced Hunting).
   - Application.Read.All  → Application
     *(required for resolving Service Principal PIM assignments)*
 
