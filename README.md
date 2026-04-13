@@ -18,6 +18,8 @@ Permissions required (for the user running the script)
   - Directory.Read.All → Application
   - User.Read.All → Application
   - Group.Read.All → Application
+  - PrivilegedAccess.Read.AzureADGroup → Application
+  - AdvancedHunting.Read.All → Application
   - Application.Read.All  → Application
     *(required for resolving Service Principal PIM assignments)*
 
@@ -26,7 +28,7 @@ Permissions required (for the user running the script)
 
 
 ## Section 3 — Sentinel Workspace RBAC (-SentinelWorkspaces)
-
+- Assign 'Reader' or 'Security Reader' to the App Registration service principal on that subscription. (Same required for Section 4 as well)
 - **Azure roles**
   - Reader on each Sentinel Resource Group
   - Reader on Subscription *(Section 3b custom role inspection)*
@@ -36,7 +38,7 @@ Permissions required (for the user running the script)
 
 
 ## Section 4 — Defender for Cloud (-ScanDefenderForCloud)
-
+- Assign 'Reader' or 'Security Reader' to the App Registration service principal on that subscription.
 - **Azure role**
   - Security Reader on each Subscription
 
