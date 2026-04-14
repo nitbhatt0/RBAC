@@ -152,6 +152,62 @@ foreach ($mod in $requiredModules) {
 }
 
 # =============================================================================
+# Helper: Expand PIM-for-Groups eligible members for a given group
+# Calls PrivilegedAccessGroupEligibilitySchedule -- requires
+#   PrivilegedAccess.Read.AzureADGroup (Application + Admin Consent)
+# Returns an array of PSCustomObjects with user detail.
+# =============================================================================
+function Get-PimGroupEligibleMembers {
+    param([string]$GroupId, [string]$GroupDisplayName)
+    $results = @()
+    try {
+        # Call the REST API directly to avoid SDK cmdlet parameter version differences
+        $uri      = "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/eligibilitySchedules?`$filter=groupId eq '$GroupId'"
+        $response = Invoke-MgGraphRequest -Method GET -Uri $uri -ErrorAction SilentlyContinue
+        $schedules = $response.value
+
+        # Page through results if there are more
+        while ($response.'@odata.nextLink') {
+            $response  = Invoke-MgGraphRequest -Method GET -Uri $response.'@odata.nextLink' -ErrorAction SilentlyContinue
+            $schedules += $response.value
+        }
+
+        foreach ($s in $schedules) {
+            # Skip Owner assignments -- we only want Member eligibility
+            if ($s.accessId -and $s.accessId -ne "member") { continue }
+            try {
+                $u = Get-MgUser -UserId $s.principalId `
+                         -Property "DisplayName,UserPrincipalName,Mail,AccountEnabled,Department,JobTitle" `
+                         -ErrorAction SilentlyContinue
+                if ($u) {
+                    $results += [PSCustomObject]@{
+                        MemberDisplayName = $u.DisplayName
+                        MemberUPN         = $u.UserPrincipalName
+                        MemberMail        = $u.Mail
+                        AccountEnabled    = $u.AccountEnabled
+                        Department        = $u.Department
+                        JobTitle          = $u.JobTitle
+                        MemberType        = "User (PIM-eligible via Group: $GroupDisplayName)"
+                        ScheduleExpiry    = $s.scheduleInfo.expiration.endDateTime
+                        ExpiryType        = $s.scheduleInfo.expiration.type
+                    }
+                }
+                else {
+                    Write-Warn "    PrincipalId $($s.principalId) is not a user (may be a group or SP) -- skipping"
+                }
+            }
+            catch { Write-Warn "    Could not resolve PIM group member $($s.principalId): $_" }
+        }
+        Write-OK "    PIM-for-Groups expansion '$GroupDisplayName': $($results.Count) eligible member(s)"
+    }
+    catch {
+        Write-Warn "    Could not query PIM eligibility schedules for group '$GroupDisplayName': $_"
+        Write-Warn "    Ensure PrivilegedAccess.Read.AzureADGroup (Application) is granted with Admin Consent."
+    }
+    return $results
+}
+
+# =============================================================================
 # SECTION 1: Entra ID Directory Roles
 # =============================================================================
 
@@ -205,28 +261,16 @@ catch {
 if ($SentinelWorkspaces.Count -gt 0 -or $ScanDefenderForCloud) {
     Write-Step "Connecting to Azure (required for Sentinel / Defender for Cloud)..."
     try {
-        # Validate existing session with a lightweight test call
-        $azCtx      = Get-AzContext
-        $tokenValid = $false
-
-        if ($azCtx -and $azCtx.Tenant.Id -eq $TenantId) {
-            try {
-                Get-AzSubscription -TenantId $TenantId -ErrorAction Stop | Out-Null
-                $tokenValid = $true
-                Write-OK "Existing Az session token validated ($($azCtx.Account.Id))"
-            }
-            catch {
-                Write-Warn "Existing Az session token is stale -- reconnecting..."
-            }
+        # Always connect using App Registration -- never reuse an existing user session
+        # to ensure consistent behaviour across all environments
+        $azCtx = Get-AzContext
+        if ($azCtx) {
+            Disconnect-AzAccount -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
         }
-
-        if (-not $tokenValid) {
-            if ($azCtx) { Disconnect-AzAccount -Confirm:$false -ErrorAction SilentlyContinue | Out-Null }
-            $azSecureSecret = ConvertTo-SecureString -String $AppClientSecret -AsPlainText -Force
-            $azCredential   = New-Object System.Management.Automation.PSCredential($AppClientId, $azSecureSecret)
-            Connect-AzAccount -TenantId $TenantId -ServicePrincipal -Credential $azCredential -ErrorAction Stop | Out-Null
-            Write-OK "Connected to Azure (App Registration: $AppClientId)"
-        }
+        $azSecureSecret = ConvertTo-SecureString -String $AppClientSecret -AsPlainText -Force
+        $azCredential   = New-Object System.Management.Automation.PSCredential($AppClientId, $azSecureSecret)
+        Connect-AzAccount -TenantId $TenantId -ServicePrincipal -Credential $azCredential -ErrorAction Stop | Out-Null
+        Write-OK "Connected to Azure (App Registration: $AppClientId)"
     }
     catch {
         Write-Error "Az connection failed: $_"
@@ -318,6 +362,28 @@ try {
                                 -Property "DisplayName,Mail,GroupTypes" `
                                 -ErrorAction SilentlyContinue
 
+                        $mdeLevel = switch ($role.DisplayName) {
+                            "Global Administrator"    { "Full MDE Access" }
+                            "Security Administrator"  { "Full MDE Read/Write" }
+                            "Security Operator"       { "MDE Response Actions" }
+                            "Security Reader"         { "MDE Read Only" }
+                            "Global Reader"           { "MDE Read Only" }
+                            "Helpdesk Administrator"  { "MDE Device Management" }
+                            "Intune Administrator"    { "MDE Device Management" }
+                            default                   { "-" }
+                        }
+                        $purviewLevel = switch ($role.DisplayName) {
+                            "Global Administrator"                { "Full Purview Access" }
+                            "Compliance Administrator"            { "Full Compliance Center" }
+                            "Compliance Data Administrator"       { "Read/Write Compliance Data" }
+                            "Security Administrator"              { "Read Purview Alerts" }
+                            "Security Reader"                     { "Read Only" }
+                            "Global Reader"                       { "Read Only" }
+                            "Information Protection Administrator" { "Sensitivity Labels & DLP" }
+                            default                               { "-" }
+                        }
+
+                        # Record the group itself
                         $entraRoleAssignments += [PSCustomObject]@{
                             RoleName          = $role.DisplayName
                             RoleId            = $role.Id
@@ -332,27 +398,62 @@ try {
                             UserType          = "Group"
                             MemberId          = $member.Id
                             AssignmentType    = "Active"
-                            MDEAccessLevel    = switch ($role.DisplayName) {
-                                "Global Administrator"    { "Full MDE Access" }
-                                "Security Administrator"  { "Full MDE Read/Write" }
-                                "Security Operator"       { "MDE Response Actions" }
-                                "Security Reader"         { "MDE Read Only" }
-                                "Global Reader"           { "MDE Read Only" }
-                                "Helpdesk Administrator"  { "MDE Device Management" }
-                                "Intune Administrator"    { "MDE Device Management" }
-                                default                   { "-" }
-                            }
-                            PurviewAccessLevel = switch ($role.DisplayName) {
-                                "Global Administrator"                { "Full Purview Access" }
-                                "Compliance Administrator"            { "Full Compliance Center" }
-                                "Compliance Data Administrator"       { "Read/Write Compliance Data" }
-                                "Security Administrator"              { "Read Purview Alerts" }
-                                "Security Reader"                     { "Read Only" }
-                                "Global Reader"                       { "Read Only" }
-                                "Information Protection Administrator" { "Sensitivity Labels & DLP" }
-                                default                               { "-" }
-                            }
+                            MDEAccessLevel    = $mdeLevel
+                            PurviewAccessLevel = $purviewLevel
                             ExportedAt        = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                        }
+
+                        # Check for direct group members
+                        $directMembers = Get-MgGroupMember -GroupId $member.Id -All -ErrorAction SilentlyContinue
+                        foreach ($dm in $directMembers) {
+                            $dmType = $dm.AdditionalProperties["@odata.type"] -replace "#microsoft.graph.",""
+                            if ($dmType -eq "user") {
+                                $du = Get-MgUser -UserId $dm.Id `
+                                        -Property "DisplayName,UserPrincipalName,Mail,AccountEnabled,Department,JobTitle" `
+                                        -ErrorAction SilentlyContinue
+                                $entraRoleAssignments += [PSCustomObject]@{
+                                    RoleName          = $role.DisplayName
+                                    RoleId            = $role.Id
+                                    RoleDescription   = $role.Description
+                                    MemberType        = "User (via Group: $($g.DisplayName))"
+                                    MemberDisplayName = $du.DisplayName
+                                    MemberUPN         = $du.UserPrincipalName
+                                    MemberMail        = $du.Mail
+                                    MemberDepartment  = $du.Department
+                                    MemberJobTitle    = $du.JobTitle
+                                    AccountEnabled    = $du.AccountEnabled
+                                    UserType          = "User"
+                                    MemberId          = $dm.Id
+                                    AssignmentType    = "Active"
+                                    MDEAccessLevel    = $mdeLevel
+                                    PurviewAccessLevel = $purviewLevel
+                                    ExportedAt        = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                                }
+                            }
+                        }
+
+                        # Also expand PIM-for-Groups eligible members (0 direct members but PIM eligible)
+                        Write-Step "    Checking PIM-for-Groups eligibility: $($g.DisplayName)"
+                        $pimGroupMembers = Get-PimGroupEligibleMembers -GroupId $member.Id -GroupDisplayName $g.DisplayName
+                        foreach ($pgm in $pimGroupMembers) {
+                            $entraRoleAssignments += [PSCustomObject]@{
+                                RoleName          = $role.DisplayName
+                                RoleId            = $role.Id
+                                RoleDescription   = $role.Description
+                                MemberType        = $pgm.MemberType
+                                MemberDisplayName = $pgm.MemberDisplayName
+                                MemberUPN         = $pgm.MemberUPN
+                                MemberMail        = $pgm.MemberMail
+                                MemberDepartment  = $pgm.Department
+                                MemberJobTitle    = $pgm.JobTitle
+                                AccountEnabled    = $pgm.AccountEnabled
+                                UserType          = "User"
+                                MemberId          = ""
+                                AssignmentType    = "PIM-Eligible (via Group)"
+                                MDEAccessLevel    = $mdeLevel
+                                PurviewAccessLevel = $purviewLevel
+                                ExportedAt        = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                            }
                         }
                     }
 
@@ -463,8 +564,11 @@ if ($IncludePIM) {
 
                 if ($group) {
                     Write-Step "    Expanding PIM group: $($group.DisplayName)"
+
+                    # Step 1: direct members of the group
                     try {
                         $groupMembers = Get-MgGroupMember -GroupId $principalId -All -ErrorAction SilentlyContinue
+                        $directCount  = 0
                         foreach ($gm in $groupMembers) {
                             $odataType = $gm.AdditionalProperties["@odata.type"] -replace "#microsoft.graph.", ""
                             if ($odataType -eq "user") {
@@ -487,17 +591,43 @@ if ($IncludePIM) {
                                     Status            = $assignment.Status
                                     ExportedAt        = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
                                 }
+                                $directCount++
                             }
                         }
-                        Write-OK "    Expanded '$($group.DisplayName)': $($groupMembers.Count) member(s)"
+                        Write-OK "    Direct members expanded '$($group.DisplayName)': $directCount user(s)"
                     }
                     catch {
-                        Write-Warn "    Could not expand PIM group '$($group.DisplayName)': $_"
-                        # Fall back to recording the group itself
+                        Write-Warn "    Could not expand direct members of PIM group '$($group.DisplayName)': $_"
+                    }
+
+                    # Step 2: PIM-for-Groups eligible members (users PIM-eligible TO the group)
+                    Write-Step "    Checking PIM-for-Groups eligibility: $($group.DisplayName)"
+                    $pimGroupMembers = Get-PimGroupEligibleMembers -GroupId $principalId -GroupDisplayName $group.DisplayName
+                    foreach ($pgm in $pimGroupMembers) {
                         $pimAssignments += [PSCustomObject]@{
                             RoleName          = $roleDef.DisplayName
                             RoleId            = $roleDefId
-                            MemberType        = "Group (could not expand)"
+                            MemberType        = $pgm.MemberType
+                            MemberDisplayName = $pgm.MemberDisplayName
+                            MemberUPN         = $pgm.MemberUPN
+                            MemberMail        = $pgm.MemberMail
+                            MemberDepartment  = $pgm.Department
+                            AssignmentType    = "PIM-Eligible (via Group)"
+                            ScheduleStartDate = $assignment.ScheduleInfo.StartDateTime
+                            ScheduleExpiry    = $pgm.ScheduleExpiry
+                            ExpiryType        = $pgm.ExpiryType
+                            MembershipType    = $assignment.MemberType
+                            Status            = $assignment.Status
+                            ExportedAt        = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                        }
+                    }
+
+                    if ($directCount -eq 0 -and $pimGroupMembers.Count -eq 0) {
+                        # Record group as-is so it still appears in output
+                        $pimAssignments += [PSCustomObject]@{
+                            RoleName          = $roleDef.DisplayName
+                            RoleId            = $roleDefId
+                            MemberType        = "Group (no members or PIM-eligible users found)"
                             MemberDisplayName = $group.DisplayName
                             MemberUPN         = $group.Mail
                             MemberMail        = $group.Mail
@@ -1052,6 +1182,20 @@ if ($IncludeXDRRBAC) {
 
     Write-Header "6/6  Defender XDR - Complete RBAC Export"
 
+    Write-Host ""
+    Write-Host "  Scanning identities with the following XDR-relevant Entra roles:" -ForegroundColor Cyan
+    Write-Host "  Scope: MDE, MDI, MDO, MDCA (Defender XDR portal)" -ForegroundColor Cyan
+    Write-Host "  ----------------------------------------------------------------" -ForegroundColor Cyan
+    Write-Host "    Global Administrator          --> Full access across MDE, MDI, MDO, MDCA" -ForegroundColor White
+    Write-Host "    Security Administrator        --> Full Read/Write across MDE, MDI, MDO, MDCA" -ForegroundColor White
+    Write-Host "    Security Operator             --> Response actions in MDE/MDO; Read in MDI/MDCA" -ForegroundColor White
+    Write-Host "    Security Reader               --> Read Only across MDE, MDI, MDO, MDCA" -ForegroundColor White
+    Write-Host "    Global Reader                 --> Read Only across MDE, MDI, MDO, MDCA" -ForegroundColor White
+    Write-Host "    Compliance Administrator      --> Limited access in MDE and MDO" -ForegroundColor White
+    Write-Host "    Helpdesk Administrator        --> Device management in MDE only" -ForegroundColor White
+    Write-Host "    Intune Administrator          --> Device management in MDE only" -ForegroundColor White
+    Write-Host ""
+
     function Resolve-GroupMembersForMDE {
         param([string]$GroupId, [string]$GroupName)
         $resolved = @()
@@ -1196,9 +1340,25 @@ if ($IncludeXDRRBAC) {
             Write-Warn "  Ensure AdvancedHunting.Read.All (Application) is granted on Microsoft Threat Protection."
         }
         else {
+            # Scoped to XDR-relevant roles only -- consistent with $targetEntraRoles in Section 1.
+            # Filters AssignedRoles to roles that grant MDE/XDR portal access.
+            # GroupMembership is included only when the identity also holds a relevant role,
+            # preventing the 100,000-row explosion from unscoped group membership queries.
             $kqlQuery = @'
+let XdrRoles = dynamic([
+    "Global Administrator",
+    "Security Administrator",
+    "Security Operator",
+    "Security Reader",
+    "Global Reader",
+    "Compliance Administrator",
+    "Helpdesk Administrator",
+    "Intune Administrator"
+]);
 IdentityInfo
-| where isnotempty(AssignedRoles) or isnotempty(GroupMembership)
+| where isnotempty(AssignedRoles)
+| mv-expand AssignedRole = AssignedRoles
+| where AssignedRole in (XdrRoles)
 | summarize arg_max(Timestamp, *) by AccountObjectId
 | project AccountUpn, AccountDisplayName, AccountObjectId, Department, JobTitle,
           IsAccountEnabled, AssignedRoles, GroupMembership, RiskLevel, BlastRadius, IdentityEnvironment
@@ -1289,6 +1449,190 @@ IdentityInfo
 else {
     Write-Warn "XDR RBAC export skipped. Use -IncludeXDRRBAC to enable."
     Write-Warn "Without MDE custom RBAC, access is controlled by Entra ID roles (see 1_EntraID_Roles)."
+}
+
+
+# =============================================================================
+# SECTION 7: Service Principals & App Registrations — Security Permissions
+# =============================================================================
+
+Write-Header "7/7  Service Principals & App Registrations — Security Permissions"
+
+$spResults = @()
+
+# Security-relevant API permissions to flag
+$sensitiveApiPermissions = @(
+    "RoleManagement.Read.All",
+    "RoleManagement.ReadWrite.All",
+    "Directory.Read.All",
+    "Directory.ReadWrite.All",
+    "User.Read.All",
+    "Group.Read.All",
+    "Application.Read.All",
+    "Application.ReadWrite.All",
+    "PrivilegedAccess.Read.AzureADGroup",
+    "PrivilegedAccess.ReadWrite.AzureADGroup",
+    "AdvancedHunting.Read.All",
+    "SecurityEvents.Read.All",
+    "SecurityEvents.ReadWrite.All",
+    "Policy.Read.All",
+    "AuditLog.Read.All",
+    "IdentityRiskyUser.Read.All",
+    "IdentityRiskEvent.Read.All"
+)
+
+# Security-relevant Entra roles (same as Section 1)
+$spTargetRoles = $targetEntraRoles
+
+try {
+    Write-Step "Fetching all Service Principals..."
+    $allSPs = Get-MgServicePrincipal -All -Property "Id,DisplayName,AppId,ServicePrincipalType,AppRoles,OAuth2PermissionScopes" -ErrorAction Stop
+    Write-OK "Found $($allSPs.Count) service principal(s) in tenant"
+
+    # -------------------------------------------------------------------------
+    # 7a -- Entra Role Assignments
+    # -------------------------------------------------------------------------
+    Write-Step "7a - Checking Entra role assignments for Service Principals..."
+
+    foreach ($role in (Get-MgDirectoryRole -All -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -in $spTargetRoles })) {
+        $members = Get-MgDirectoryRoleMember -DirectoryRoleId $role.Id -All -ErrorAction SilentlyContinue
+        foreach ($m in $members) {
+            $odataType = $m.AdditionalProperties["@odata.type"] -replace "#microsoft.graph.",""
+            if ($odataType -eq "servicePrincipal") {
+                $sp = $allSPs | Where-Object { $_.Id -eq $m.Id }
+                $isRunningApp = ($sp.AppId -eq $AppClientId)
+                $spResults += [PSCustomObject]@{
+                    SPDisplayName    = $sp.DisplayName
+                    AppId            = $sp.AppId
+                    SPType           = $sp.ServicePrincipalType
+                    PermissionSource = "Entra Role"
+                    Permission       = $role.DisplayName
+                    PermissionScope  = "Entra ID"
+                    IsRunningApp     = if ($isRunningApp) { "YES - THIS IS THE APP RUNNING THE SCRIPT" } else { "" }
+                    ExportedAt       = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                }
+            }
+        }
+    }
+    Write-OK "7a - Entra role scan complete"
+
+    # -------------------------------------------------------------------------
+    # 7b -- Azure RBAC Role Assignments (requires Az session)
+    # -------------------------------------------------------------------------
+    if ($SentinelWorkspaces.Count -gt 0 -or $ScanDefenderForCloud) {
+        Write-Step "7b - Checking Azure RBAC assignments for Service Principals..."
+
+        $securityAzureRoles = @("Owner","Contributor","Security Admin","Security Reader",
+                                "Microsoft Sentinel Contributor","Microsoft Sentinel Reader",
+                                "Microsoft Sentinel Responder","Log Analytics Contributor")
+
+        try {
+            $allAzSubs = Get-AzSubscription -TenantId $TenantId -ErrorAction SilentlyContinue
+            foreach ($sub in $allAzSubs) {
+                Set-AzContext -SubscriptionId $sub.Id -Tenant $TenantId -ErrorAction SilentlyContinue | Out-Null
+                $assignments = Get-AzRoleAssignment -ErrorAction SilentlyContinue |
+                    Where-Object { $_.ObjectType -eq "ServicePrincipal" -and $_.RoleDefinitionName -in $securityAzureRoles }
+                foreach ($ra in $assignments) {
+                    $sp = $allSPs | Where-Object { $_.Id -eq $ra.ObjectId }
+                    $isRunningApp = ($sp.AppId -eq $AppClientId)
+                    $spResults += [PSCustomObject]@{
+                        SPDisplayName    = $ra.DisplayName
+                        AppId            = if ($sp) { $sp.AppId } else { "" }
+                        SPType           = "ServicePrincipal"
+                        PermissionSource = "Azure RBAC"
+                        Permission       = $ra.RoleDefinitionName
+                        PermissionScope  = $ra.Scope
+                        IsRunningApp     = if ($isRunningApp) { "YES - THIS IS THE APP RUNNING THE SCRIPT" } else { "" }
+                        ExportedAt       = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                    }
+                }
+            }
+            Write-OK "7b - Azure RBAC scan complete"
+        }
+        catch {
+            Write-Warn "7b - Azure RBAC scan failed: $_"
+        }
+    }
+    else {
+        Write-Warn "7b - Azure RBAC scan skipped (no -SentinelWorkspaces or -ScanDefenderForCloud provided)"
+    }
+
+    # -------------------------------------------------------------------------
+    # 7c -- API Permissions (Application permissions granted to SPs)
+    # -------------------------------------------------------------------------
+    Write-Step "7c - Checking API permissions for Service Principals..."
+
+    # Get all OAuth2 permission grants and app role assignments
+    $appRoleAssignments = Get-MgServicePrincipalAppRoleAssignment -ServicePrincipalId (
+        Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0000-c000-000000000000'" -ErrorAction SilentlyContinue
+    ).Id -All -ErrorAction SilentlyContinue
+
+    # Build a lookup of Graph app roles (id -> permission name)
+    $graphSP = Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0000-c000-000000000000'" -ErrorAction SilentlyContinue
+    $graphRoleLookup = @{}
+    if ($graphSP) {
+        foreach ($r in $graphSP.AppRoles) { $graphRoleLookup[$r.Id.ToString()] = $r.Value }
+    }
+
+    # Also check MTP app roles
+    $mtpSP = Get-MgServicePrincipal -Filter "appId eq '8ee8fdad-f234-4243-8f3b-15c294843740'" -ErrorAction SilentlyContinue
+    $mtpRoleLookup = @{}
+    if ($mtpSP) {
+        foreach ($r in $mtpSP.AppRoles) { $mtpRoleLookup[$r.Id.ToString()] = $r.Value }
+    }
+
+    foreach ($sp in $allSPs) {
+        try {
+            $assignments = Get-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id -All -ErrorAction SilentlyContinue
+            foreach ($a in $assignments) {
+                $permName = ""
+                if ($graphRoleLookup.ContainsKey($a.AppRoleId.ToString())) {
+                    $permName = $graphRoleLookup[$a.AppRoleId.ToString()]
+                }
+                elseif ($mtpRoleLookup.ContainsKey($a.AppRoleId.ToString())) {
+                    $permName = $mtpRoleLookup[$a.AppRoleId.ToString()]
+                }
+                if ($permName -and $permName -in $sensitiveApiPermissions) {
+                    $isRunningApp = ($sp.AppId -eq $AppClientId)
+                    $spResults += [PSCustomObject]@{
+                        SPDisplayName    = $sp.DisplayName
+                        AppId            = $sp.AppId
+                        SPType           = $sp.ServicePrincipalType
+                        PermissionSource = "API Permission (Application)"
+                        Permission       = $permName
+                        PermissionScope  = "Microsoft Graph / MTP"
+                        IsRunningApp     = if ($isRunningApp) { "YES - THIS IS THE APP RUNNING THE SCRIPT" } else { "" }
+                        ExportedAt       = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                    }
+                }
+            }
+        }
+        catch { }
+    }
+    Write-OK "7c - API permission scan complete"
+
+    # Flag the running app explicitly if not already found
+    $runningAppFound = $spResults | Where-Object { $_.IsRunningApp -eq "YES - THIS IS THE APP RUNNING THE SCRIPT" }
+    if (-not $runningAppFound) {
+        Write-Warn "  Running App Registration ($AppClientId) not found in any security role/permission scan."
+        Write-Warn "  It may only have API permissions not covered by the sensitive permission list."
+    }
+    else {
+        Write-OK "  Running App Registration ($AppClientId) identified in output -- flagged with IsRunningApp = YES"
+    }
+
+    Export-Results -Data $spResults -FileName "7_ServicePrincipal_SecurityPermissions" -Format $ExportFormat
+
+    Write-Host ""
+    Write-Host "  Section 7 Summary" -ForegroundColor Cyan
+    Write-Host "  -----------------" -ForegroundColor Cyan
+    Write-Host "  Total SP permission entries : $($spResults.Count)" -ForegroundColor White
+    Write-Host "  Unique SPs found            : $(($spResults | Select-Object -ExpandProperty AppId -Unique).Count)" -ForegroundColor White
+    Write-Host "  Running app flagged         : $(if ($runningAppFound) { 'Yes' } else { 'No' })" -ForegroundColor White
+    Write-Host ""
+}
+catch {
+    Write-Error "Section 7 failed: $_"
 }
 
 # =============================================================================
