@@ -34,7 +34,7 @@ Permissions required (for the user running the script)
   - Reader on each Sentinel Resource Group
   - Reader on Subscription *(Section 3b custom role inspection)*
 
-> ⚠️ **Note:**  
+> **Note:**  
 > Reader at Resource Group scope does not cover subscription-level role definitions — both scopes are needed.
 
 
