@@ -1,3 +1,66 @@
+=======================================================================
+Entra ID Roles & XDR Portal Access — Script Coverage
+=======================================================================
+
+The script targets the following Entra ID built-in roles that grant
+access to the Microsoft Defender XDR portal (security.microsoft.com),
+including MDE, MDI, MDO, MDCA, and Advanced Hunting:
+
+  - Global Administrator
+  - Security Administrator
+  - Security Operator
+  - Security Reader
+  - Global Reader
+  - Compliance Administrator
+  - Compliance Data Administrator
+  - Information Protection Administrator
+  - Helpdesk Administrator
+  - Intune Administrator
+
+These are captured in:
+  - 1_Entra_Security_Roles.csv       (active assignments)
+  - 2_EntraID_PIM_EligibleRoles.csv  (PIM eligible assignments)
+
+-----------------------------------------------------------------------
+Azure Subscription-Level Roles
+-----------------------------------------------------------------------
+
+The script additionally captures Azure RBAC roles relevant to
+Sentinel and Defender for Cloud. These are resource-level permissions
+and do not grant access to the XDR portal directly.
+
+  Sentinel  -> Sentinel Contributor, Sentinel Reader,
+               Sentinel Responder, Log Analytics Contributor
+  MDC       -> Owner, Contributor, Security Admin
+
+These are captured in:
+  - 3_Sentinel_Workspace_Roles.csv
+  - 4_MDC_RBAC_Assignments.csv
+
+-----------------------------------------------------------------------
+Known Gap — Unified RBAC Custom Roles
+-----------------------------------------------------------------------
+
+Custom roles created directly in the Defender portal
+(Permissions & Roles > Microsoft Defender XDR) are NOT captured
+by this script.
+
+Reason: Microsoft does not currently expose a supported API endpoint
+for querying Unified RBAC custom roles via application-only
+authentication.
+
+Recommendation: Export Unified RBAC custom roles manually from:
+  Defender portal > System > Permissions > Roles > Export
+
+Reference:
+  https://techcommunity.microsoft.com/blog/microsoftsentinelblog/
+  managing-microsoft-sentinel-and-microsoft-defender-xdr-permissions
+  -in-microsoft-/4480583
+
+=======================================================================
+=======================================================================
+
+
 Permissions required (for the user running the script)
 
 ## Section 1 — Entra ID Directory Roles (always runs)
